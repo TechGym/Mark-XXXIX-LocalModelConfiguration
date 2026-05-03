@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import re
 import sys
 import threading
@@ -371,6 +372,61 @@ _session_lock = threading.Lock()
 _session_up   = False
 
 
+def _ollama_vision_tts(text: str) -> None:
+    if os.environ.get("MARK_DISABLE_TTS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    if not (text or "").strip():
+        return
+    try:
+        import pyttsx3
+
+        e = pyttsx3.init()
+        e.say(text)
+        e.runAndWait()
+    except Exception as ex:
+        print(f"[Vision] TTS (Ollama): {ex}")
+
+
+def _screen_process_ollama_worker(
+    angle: str,
+    user_text: str,
+    player,
+) -> None:
+    try:
+        from mark_llm_settings import get_ollama_vision_model, ollama_chat_with_image_reply
+
+        if angle == "camera":
+            image_bytes, _mime = _capture_camera()
+            print(f"[Vision] 📷 Camera (Ollama): {len(image_bytes):,} bytes")
+        else:
+            image_bytes, _mime = _capture_screen()
+            print(f"[Vision] 🖥️  Screen (Ollama): {len(image_bytes):,} bytes")
+    except Exception as e:
+        print(f"[Vision] ❌ Capture error (Ollama): {e}")
+        return
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    try:
+        reply = ollama_chat_with_image_reply(
+            user_text=user_text,
+            image_b64=b64,
+            system=_SYSTEM_PROMPT,
+            model=get_ollama_vision_model(),
+            timeout=180,
+        )
+        print(f"[Vision] 🤖 Ollama: {reply[:240]!r}")
+        if player is not None and hasattr(player, "write_log"):
+            player.write_log(f"Jarvis (vision): {reply}")
+        _ollama_vision_tts(reply)
+    except Exception as e:
+        print(f"[Vision] ❌ Ollama vision failed: {e}")
+
+
 def _ensure_session(player=None) -> None:
     global _session_up
     with _session_lock:
@@ -399,6 +455,20 @@ def screen_process(
     print(f"[Vision] ▶ angle={angle!r}  question='{user_text[:80]}'")
 
     try:
+        from mark_llm_settings import is_ollama_mode
+
+        if is_ollama_mode():
+            threading.Thread(
+                target=_screen_process_ollama_worker,
+                args=(angle, user_text, player),
+                daemon=True,
+                name="OllamaVisionWorker",
+            ).start()
+            return True
+    except Exception as e:
+        print(f"[Vision] ⚠️  Ollama branch: {e}")
+
+    try:
         _ensure_session(player=player)
     except Exception as e:
         print(f"[Vision] ❌ Could not start session: {e}")
@@ -420,6 +490,13 @@ def screen_process(
 
 
 def warmup_session(player=None) -> None:
+    try:
+        from mark_llm_settings import is_ollama_mode
+
+        if is_ollama_mode():
+            return
+    except Exception:
+        pass
     try:
         _ensure_session(player=player)
     except Exception as e:

@@ -296,7 +296,60 @@ def _focus_window(title: str) -> str:
 
     return f"focus_window: unknown OS '{os_name}'"
 
+def _screen_find_coords_from_text(text: str) -> tuple[int, int] | None:
+    t = (text or "").strip()
+    if "NOT_FOUND" in t.upper():
+        return None
+    match = re.search(r"(\d+)\s*,\s*(\d+)", t)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def _screen_find_ollama(description: str) -> tuple[int, int] | None:
+    try:
+        from mark_llm_settings import get_ollama_vision_model, ollama_chat_with_image_reply
+
+        _require_pyautogui()
+        w, h = pyautogui.size()
+        img = pyautogui.screenshot()
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        image_bytes = buf.getvalue()
+        import base64
+
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        prompt = (
+            f"This is a screenshot of a {w}×{h} pixel screen. "
+            f"Locate the UI element described as: {description!r}. "
+            "Reply with ONLY the center coordinates as: x,y "
+            "If the element is not visible, reply: NOT_FOUND"
+        )
+        text = ollama_chat_with_image_reply(
+            user_text=prompt,
+            image_b64=b64,
+            system=(
+                "You return only coordinates x,y or the words NOT_FOUND. "
+                "No other text."
+            ),
+            model=get_ollama_vision_model(),
+            timeout=120,
+        )
+        return _screen_find_coords_from_text(text)
+    except Exception as e:
+        print(f"[ComputerControl] ⚠️ screen_find (Ollama) failed: {e}")
+    return None
+
+
 def _screen_find(description: str) -> tuple[int, int] | None:
+    try:
+        from mark_llm_settings import is_ollama_mode
+
+        if is_ollama_mode():
+            return _screen_find_ollama(description)
+    except Exception as e:
+        print(f"[ComputerControl] ⚠️ screen_find mode check: {e}")
+
     api_key = _get_api_key()
     if not api_key:
         print("[ComputerControl] ⚠️ No API key for screen_find")
@@ -330,12 +383,7 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         )
 
         text = (response.text or "").strip()
-        if "NOT_FOUND" in text.upper():
-            return None
-
-        match = re.search(r"(\d+)\s*,\s*(\d+)", text)
-        if match:
-            return int(match.group(1)), int(match.group(2))
+        return _screen_find_coords_from_text(text)
 
     except Exception as e:
         print(f"[ComputerControl] ⚠️ screen_find failed: {e}")

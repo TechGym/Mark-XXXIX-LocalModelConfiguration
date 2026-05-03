@@ -158,26 +158,31 @@ def _get_transcript(video_id: str) -> str | None:
 
 
 def _summarize_with_gemini(transcript: str, video_url: str) -> str:
+    from mark_llm_settings import is_ollama_mode, ollama_generate_text
+
+    sys_inst = (
+        "You are JARVIS, an AI assistant. "
+        "Summarize YouTube video transcripts clearly and concisely. "
+        "Structure: 1-sentence overview, then 3-5 key points. "
+        "Be direct. Address the user as 'sir'. "
+        "Match the language of the transcript."
+    )
+    max_chars = 80000
+    truncated = transcript[:max_chars] + ("..." if len(transcript) > max_chars else "")
+    user_msg = f"Please summarize this YouTube video transcript:\n\n{truncated}"
+
+    if is_ollama_mode():
+        return ollama_generate_text(user_msg, system_instruction=sys_inst)
+
     import google.generativeai as genai
 
     genai.configure(api_key=_get_api_key())
     model = genai.GenerativeModel(
         model_name="gemini-2.5-flash",
-        system_instruction=(
-            "You are JARVIS, an AI assistant. "
-            "Summarize YouTube video transcripts clearly and concisely. "
-            "Structure: 1-sentence overview, then 3-5 key points. "
-            "Be direct. Address the user as 'sir'. "
-            "Match the language of the transcript."
-        )
+        system_instruction=sys_inst,
     )
-
-    max_chars = 80000
-    truncated = transcript[:max_chars] + ("..." if len(transcript) > max_chars else "")
-    response  = model.generate_content(
-        f"Please summarize this YouTube video transcript:\n\n{truncated}"
-    )
-    return response.text.strip()
+    response = model.generate_content(user_msg)
+    return (response.text or "").strip()
 
 
 def _save_summary(content: str, video_url: str) -> str:

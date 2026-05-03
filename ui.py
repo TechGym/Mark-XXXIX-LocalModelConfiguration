@@ -23,9 +23,9 @@ from PyQt6.QtGui import (
     QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
-    QVBoxLayout, QWidget, QProgressBar,
+    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy,
+    QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
 
 def _base_dir() -> Path:
@@ -856,7 +856,9 @@ class _DropCanvas(QWidget):
 
 
 class SetupOverlay(QWidget):
-    done = pyqtSignal(str, str)
+    """api_key (empty for local), os key, use_ollama flag."""
+
+    done = pyqtSignal(str, str, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -875,8 +877,8 @@ class SetupOverlay(QWidget):
         self._sel_os = detected
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 22, 30, 22)
-        layout.setSpacing(8)
+        layout.setContentsMargins(30, 18, 30, 18)
+        layout.setSpacing(6)
 
         def _lbl(txt, font_size=9, bold=False, color=C.PRI,
                  align=Qt.AlignmentFlag.AlignCenter):
@@ -887,33 +889,16 @@ class SetupOverlay(QWidget):
             w.setStyleSheet(f"color: {color}; background: transparent;")
             return w
 
-        layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
-        layout.addWidget(_lbl("Configure J.A.R.V.I.S. before first boot.", 9, color=C.PRI_DIM))
-        layout.addSpacing(6)
-
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep)
-        layout.addSpacing(4)
-
-        layout.addWidget(_lbl("GEMINI API KEY", 8, color=C.TEXT_DIM,
-                               align=Qt.AlignmentFlag.AlignLeft))
-        self._key_input = QLineEdit()
-        self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_input.setPlaceholderText("AIza…")
-        self._key_input.setFont(QFont("Courier New", 10))
-        self._key_input.setFixedHeight(32)
-        self._key_input.setStyleSheet(f"""
+        _le_style = f"""
             QLineEdit {{
                 background: #000d12; color: {C.TEXT};
                 border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
             }}
             QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
-        """)
-        layout.addWidget(self._key_input)
-        layout.addSpacing(12)
+        """
 
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep2)
+        layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
+        layout.addWidget(_lbl("Configure J.A.R.V.I.S. before first boot.", 9, color=C.PRI_DIM))
         layout.addSpacing(4)
 
         layout.addWidget(_lbl("OPERATING SYSTEM", 8, color=C.TEXT_DIM,
@@ -922,7 +907,8 @@ class SetupOverlay(QWidget):
         layout.addWidget(_lbl(f"Auto-detected: {det_name}", 8, color=C.ACC2,
                                align=Qt.AlignmentFlag.AlignLeft))
 
-        os_row = QHBoxLayout(); os_row.setSpacing(6)
+        os_row = QHBoxLayout()
+        os_row.setSpacing(6)
         self._os_btns: dict[str, QPushButton] = {}
         for key, label in [("windows","⊞  Windows"),("mac","  macOS"),("linux","🐧  Linux")]:
             btn = QPushButton(label)
@@ -934,13 +920,71 @@ class SetupOverlay(QWidget):
             self._os_btns[key] = btn
         layout.addLayout(os_row)
         self._sel(detected)
-        layout.addSpacing(12)
 
-        init_btn = QPushButton("▸  INITIALISE SYSTEMS")
-        init_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
-        init_btn.setFixedHeight(36)
-        init_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        init_btn.setStyleSheet(f"""
+        sep0 = QFrame()
+        sep0.setFrameShape(QFrame.Shape.HLine)
+        sep0.setStyleSheet(f"color: {C.BORDER};")
+        layout.addWidget(sep0)
+        layout.addSpacing(2)
+
+        layout.addWidget(_lbl("LOCAL OLLAMA (no Gemini API key)", 8, color=C.TEXT_DIM,
+                               align=Qt.AlignmentFlag.AlignLeft))
+        layout.addWidget(_lbl(
+            "Uses the same env overrides as Aletheon: ALETHEON_LLM_ASSIST_OLLAMA_URL / _MODEL",
+            7, color=C.TEXT_MED, align=Qt.AlignmentFlag.AlignLeft,
+        ))
+        layout.addWidget(_lbl("Ollama host", 8, color=C.TEXT_DIM,
+                               align=Qt.AlignmentFlag.AlignLeft))
+        self._ollama_url = QLineEdit("http://127.0.0.1:11434")
+        self._ollama_url.setFont(QFont("Courier New", 9))
+        self._ollama_url.setFixedHeight(28)
+        self._ollama_url.setStyleSheet(_le_style)
+        layout.addWidget(self._ollama_url)
+        layout.addWidget(_lbl("Model tag", 8, color=C.TEXT_DIM,
+                               align=Qt.AlignmentFlag.AlignLeft))
+        self._ollama_model = QLineEdit("dolphin-llama3:8b")
+        self._ollama_model.setFont(QFont("Courier New", 9))
+        self._ollama_model.setFixedHeight(28)
+        self._ollama_model.setStyleSheet(_le_style)
+        layout.addWidget(self._ollama_model)
+
+        local_btn = QPushButton("▸  CONNECT LOCAL OLLAMA")
+        local_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        local_btn.setFixedHeight(34)
+        local_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        local_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #001a0d; color: {C.GREEN};
+                border: 1px solid {C.GREEN}; border-radius: 3px;
+            }}
+            QPushButton:hover {{
+                background: #002414; border: 1px solid {C.TEXT};
+            }}
+        """)
+        local_btn.clicked.connect(self._submit_local)
+        layout.addWidget(local_btn)
+
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.Shape.HLine)
+        sep1.setStyleSheet(f"color: {C.BORDER};")
+        layout.addWidget(sep1)
+        layout.addSpacing(2)
+
+        layout.addWidget(_lbl("GEMINI (cloud — real-time voice + native audio)", 8, color=C.TEXT_DIM,
+                               align=Qt.AlignmentFlag.AlignLeft))
+        self._key_input = QLineEdit()
+        self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._key_input.setPlaceholderText("AIza…")
+        self._key_input.setFont(QFont("Courier New", 10))
+        self._key_input.setFixedHeight(32)
+        self._key_input.setStyleSheet(_le_style)
+        layout.addWidget(self._key_input)
+
+        gem_btn = QPushButton("▸  INITIALISE WITH GEMINI")
+        gem_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        gem_btn.setFixedHeight(34)
+        gem_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        gem_btn.setStyleSheet(f"""
             QPushButton {{
                 background: transparent; color: {C.PRI};
                 border: 1px solid {C.PRI_DIM}; border-radius: 3px;
@@ -949,8 +993,8 @@ class SetupOverlay(QWidget):
                 background: {C.PRI_GHO}; border: 1px solid {C.PRI};
             }}
         """)
-        init_btn.clicked.connect(self._submit)
-        layout.addWidget(init_btn)
+        gem_btn.clicked.connect(self._submit_gemini)
+        layout.addWidget(gem_btn)
 
     def _sel(self, key: str):
         self._sel_os = key
@@ -973,7 +1017,10 @@ class SetupOverlay(QWidget):
                     QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
                 """)
 
-    def _submit(self):
+    def _submit_local(self) -> None:
+        self.done.emit("", self._sel_os, True)
+
+    def _submit_gemini(self) -> None:
         key = self._key_input.text().strip()
         if not key:
             self._key_input.setStyleSheet(
@@ -981,12 +1028,86 @@ class SetupOverlay(QWidget):
                 f" QLineEdit {{ border: 1px solid {C.RED}; }}"
             )
             return
-        self.done.emit(key, self._sel_os)
+        self.done.emit(key, self._sel_os, False)
+
+
+class PttHoldButton(QPushButton):
+    """Hold left mouse: record mono int16 @ 16 kHz; release to emit PCM for Whisper."""
+
+    pcm_ready = pyqtSignal(bytes)
+
+    _SR = 16000
+
+    def __init__(self) -> None:
+        super().__init__("Hold to speak (PTT)")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(32)
+        self.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: #001218; color: {C.PRI};
+                border: 2px solid {C.BORDER_B}; border-radius: 4px;
+            }}
+            QPushButton:pressed {{ background: #002028; border: 2px solid {C.PRI}; }}
+        """)
+        self.setToolTip(
+            "Hold, speak, release — audio is transcribed locally (faster-whisper) "
+            "then sent to Ollama."
+        )
+        self._recording = False
+        self._chunks: list[bytes] = []
+        self._stream = None
+
+    def _callback(self, indata, _frames, _time, _status) -> None:
+        if self._recording:
+            self._chunks.append(indata.copy().tobytes())
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            try:
+                import sounddevice as sd
+            except ImportError:
+                print("[PTT] sounddevice not installed")
+                super().mousePressEvent(event)
+                return
+            self._chunks = []
+            self._recording = True
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=self._SR,
+                    channels=1,
+                    dtype="int16",
+                    callback=self._callback,
+                )
+                self._stream.start()
+            except Exception as e:
+                self._recording = False
+                self._stream = None
+                print(f"[PTT] start failed: {e}")
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._recording:
+            self._recording = False
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            pcm = b"".join(self._chunks)
+            self._chunks = []
+            if len(pcm) >= 3200:
+                self.pcm_ready.emit(pcm)
+        super().mouseReleaseEvent(event)
 
 
 class MainWindow(QMainWindow):
     _log_sig   = pyqtSignal(str)
     _state_sig = pyqtSignal(str)
+    _ollama_models_sig = pyqtSignal(list, str)
+    ollama_attached = pyqtSignal(object)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1003,6 +1124,7 @@ class MainWindow(QMainWindow):
         self.on_text_command  = None
         self._muted           = False
         self._current_file: str | None = None
+        self._ollama_backend = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -1043,11 +1165,15 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
+        self._ollama_models_sig.connect(self._on_ollama_models_loaded)
+        self.ollama_attached.connect(self._on_ollama_attached)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
         if not self._ready:
             self._show_setup()
+        else:
+            self._try_show_ollama_model_selector()
 
         sc_mute = QShortcut(QKeySequence("F4"), self)
         sc_mute.activated.connect(self._toggle_mute)
@@ -1063,7 +1189,7 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._overlay and self._overlay.isVisible():
-            ow, oh = 460, 390
+            ow, oh = 480, 560
             cw = self.centralWidget()
             self._overlay.setGeometry(
                 (cw.width()  - ow) // 2,
@@ -1276,6 +1402,64 @@ class MainWindow(QMainWindow):
         sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
         lay.addWidget(sep2)
 
+        self._ollama_model_wrap = QWidget()
+        self._ollama_model_wrap.setVisible(False)
+        om_lay = QVBoxLayout(self._ollama_model_wrap)
+        om_lay.setContentsMargins(0, 0, 0, 0)
+        om_lay.setSpacing(4)
+        om_lay.addWidget(_sec("OLLAMA MODEL"))
+        self._ollama_model_hint = QLabel("")
+        self._ollama_model_hint.setFont(QFont("Courier New", 6))
+        self._ollama_model_hint.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._ollama_model_hint.setWordWrap(True)
+        om_lay.addWidget(self._ollama_model_hint)
+        om_row = QHBoxLayout()
+        om_row.setSpacing(4)
+        self._ollama_model_combo = QComboBox()
+        self._ollama_model_combo.setFont(QFont("Courier New", 8))
+        self._ollama_model_combo.setMinimumHeight(28)
+        self._ollama_model_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: #000d12; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 6px;
+            }}
+            QComboBox:hover {{ border: 1px solid {C.BORDER_B}; }}
+        """)
+        self._ollama_model_combo.currentTextChanged.connect(self._on_ollama_model_user_changed)
+        ref_btn = QPushButton("↻")
+        ref_btn.setFixedSize(28, 28)
+        ref_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        ref_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ref_btn.setToolTip("Refresh model list from Ollama")
+        ref_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PANEL}; color: {C.PRI};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ border: 1px solid {C.PRI}; }}
+        """)
+        ref_btn.clicked.connect(self._refresh_ollama_models_async)
+        om_row.addWidget(self._ollama_model_combo, stretch=1)
+        om_row.addWidget(ref_btn)
+        om_lay.addLayout(om_row)
+        lay.addWidget(self._ollama_model_wrap)
+
+        sep3 = QFrame()
+        sep3.setFrameShape(QFrame.Shape.HLine)
+        sep3.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        lay.addWidget(sep3)
+
+        self._ptt_wrap = QWidget()
+        self._ptt_wrap.setVisible(False)
+        ptt_lay = QVBoxLayout(self._ptt_wrap)
+        ptt_lay.setContentsMargins(0, 0, 0, 0)
+        ptt_lay.setSpacing(4)
+        ptt_lay.addWidget(_sec("LOCAL VOICE (PTT)"))
+        self._ptt_btn = PttHoldButton()
+        self._ptt_btn.pcm_ready.connect(self._on_ptt_pcm)
+        ptt_lay.addWidget(self._ptt_btn)
+        lay.addWidget(self._ptt_wrap)
+
         lay.addWidget(_sec("COMMAND INPUT"))
         lay.addLayout(self._build_input_row())
 
@@ -1409,22 +1593,43 @@ class MainWindow(QMainWindow):
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 
+    def _on_ollama_attached(self, jarvis) -> None:
+        self._ollama_backend = jarvis
+        self._ptt_wrap.setVisible(True)
+
+    def _on_ptt_pcm(self, pcm: bytes) -> None:
+        if self._ollama_backend is None:
+            return
+        self._log.append_log("SYS: PTT — sending audio to local STT…")
+        self._ollama_backend.feed_pcm(pcm)
+
     def _apply_state(self, state: str):
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
 
     def _check_config(self) -> bool:
-        if not API_FILE.exists(): return False
+        if not API_FILE.exists():
+            return False
         try:
             d = json.loads(API_FILE.read_text(encoding="utf-8"))
-            return bool(d.get("gemini_api_key")) and bool(d.get("os_system"))
         except Exception:
             return False
+        if not d.get("os_system"):
+            return False
+        env_local = os.environ.get("MARK_LLM_PROVIDER", "").strip().lower() == "ollama"
+        if env_local:
+            return True
+        prov = (d.get("llm_provider") or "").strip().lower()
+        if prov == "ollama":
+            return bool((d.get("ollama_model") or "").strip())
+        if (d.get("ollama_model") or "").strip() and not (d.get("gemini_api_key") or "").strip():
+            return True
+        return bool((d.get("gemini_api_key") or "").strip())
 
     def _show_setup(self):
         ov = SetupOverlay(self.centralWidget())
         cw = self.centralWidget()
-        ow, oh = 460, 390
+        ow, oh = 480, 560
         ov.setGeometry(
             (cw.width()  - ow) // 2,
             (cw.height() - oh) // 2,
@@ -1434,18 +1639,112 @@ class MainWindow(QMainWindow):
         ov.show()
         self._overlay = ov
 
-    def _on_setup_done(self, key: str, os_name: str):
+    def _on_setup_done(self, key: str, os_name: str, use_ollama: bool):
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
-            encoding="utf-8",
-        )
+        if use_ollama:
+            o_url = "http://127.0.0.1:11434"
+            o_model = "dolphin-llama3:8b"
+            if self._overlay:
+                o_url = (self._overlay._ollama_url.text().strip() or o_url)
+                o_model = (self._overlay._ollama_model.text().strip() or o_model)
+            cfg = {
+                "llm_provider": "ollama",
+                "ollama_url": o_url,
+                "ollama_model": o_model,
+                "gemini_api_key": "",
+                "os_system": os_name,
+            }
+            log_extra = f"LOCAL_OLLAMA model={o_model}"
+        else:
+            cfg = {
+                "llm_provider": "gemini",
+                "gemini_api_key": key,
+                "os_system": os_name,
+            }
+            log_extra = "GEMINI_CLOUD"
+        API_FILE.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
         self._ready = True
         if self._overlay:
             self._overlay.hide()
             self._overlay = None
         self._apply_state("LISTENING")
-        self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. JARVIS online.")
+        self._log.append_log(
+            f"SYS: Initialised. OS={os_name.upper()}. Mode={log_extra}. JARVIS online."
+        )
+        self._try_show_ollama_model_selector()
+
+    def _try_show_ollama_model_selector(self) -> None:
+        try:
+            from mark_llm_settings import is_ollama_mode, ollama_model_env_locked
+        except ImportError:
+            return
+        if not hasattr(self, "_ollama_model_wrap"):
+            return
+        if not is_ollama_mode():
+            self._ollama_model_wrap.setVisible(False)
+            return
+        self._ollama_model_wrap.setVisible(True)
+        locked = ollama_model_env_locked()
+        self._ollama_model_combo.setEnabled(not locked)
+        self._ollama_model_hint.setText(
+            "Model from Ollama /api/tags (Aletheon-style). "
+            + (
+                "MARK_OLLAMA_MODEL or ALETHEON_LLM_ASSIST_OLLAMA_MODEL is set — env overrides this list."
+                if locked
+                else "Selection is saved to config/api_keys.json."
+            )
+        )
+        self._refresh_ollama_models_async()
+
+    def _refresh_ollama_models_async(self) -> None:
+        def work() -> None:
+            try:
+                from mark_llm_settings import get_ollama_model, list_ollama_models
+
+                names = list_ollama_models()
+                cur = get_ollama_model()
+            except Exception:
+                names, cur = [], "dolphin-llama3:8b"
+            self._ollama_models_sig.emit(names, cur)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_ollama_models_loaded(self, names: list, current: str) -> None:
+        if not hasattr(self, "_ollama_model_combo"):
+            return
+        self._ollama_model_combo.blockSignals(True)
+        self._ollama_model_combo.clear()
+        ordered = list(dict.fromkeys([*(names or []), current]))
+        for n in ordered:
+            if n and isinstance(n, str):
+                self._ollama_model_combo.addItem(n)
+        idx = self._ollama_model_combo.findText(current)
+        if idx >= 0:
+            self._ollama_model_combo.setCurrentIndex(idx)
+        elif self._ollama_model_combo.count() > 0:
+            self._ollama_model_combo.setCurrentIndex(0)
+        self._ollama_model_combo.blockSignals(False)
+
+    def _on_ollama_model_user_changed(self, model_name: str) -> None:
+        m = (model_name or "").strip()
+        if not m:
+            return
+        self._persist_ollama_model(m)
+
+    def _persist_ollama_model(self, model: str) -> None:
+        if not API_FILE.exists():
+            return
+        try:
+            data = json.loads(API_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        data["ollama_model"] = model
+        try:
+            API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+        except OSError:
+            return
+        self._log.append_log(f"SYS: Ollama model → {model}")
+
 
 class _RootShim:
     def __init__(self, app: QApplication):

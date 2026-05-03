@@ -47,5 +47,8 @@ def get_gemini_key() -> str | None:
     return load_api_keys().get("gemini_api_key")
 
 def is_configured() -> bool:
+    data = load_api_keys()
+    if (data.get("llm_provider") or "").strip().lower() == "ollama":
+        return bool((data.get("ollama_model") or "").strip())
     key = get_gemini_key()
     return bool(key and len(key) > 15)

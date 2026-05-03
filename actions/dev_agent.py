@@ -30,6 +30,16 @@ def _get_model(model_name: str):
     return genai.GenerativeModel(model_name)
 
 
+def _llm_generate(prompt: str) -> str:
+    from mark_llm_settings import is_ollama_mode, ollama_generate_text
+
+    if is_ollama_mode():
+        return ollama_generate_text(prompt, system_instruction=None)
+    model = _get_model(MODEL_WRITER)
+    response = model.generate_content(prompt)
+    return (response.text or "").strip()
+
+
 def _strip_fences(text: str) -> str:
     text = text.strip()
     text = re.sub(r"^```[a-zA-Z]*\r?\n?", "", text)
@@ -97,8 +107,6 @@ class RateLimitError(Exception):
 
 
 def _plan_project(description: str, language: str) -> dict:
-    model = _get_model(MODEL_PLANNER)
-
     prompt = f"""You are a senior software architect. Create a minimal, complete file plan for this project.
 
 Language: {language}
@@ -134,12 +142,13 @@ Critical rules:
 
 JSON:"""
 
+    text = ""
     try:
-        response = model.generate_content(prompt)
-        raw = _strip_fences(response.text)
+        text = _llm_generate(prompt)
+        raw = _strip_fences(text)
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Planner returned invalid JSON: {e}\nRaw: {response.text[:300]}")
+        raise ValueError(f"Planner returned invalid JSON: {e}\nRaw: {text[:300]}")
     except Exception as e:
         if _is_rate_limit(e):
             raise RateLimitError(str(e))
@@ -153,8 +162,6 @@ def _write_file(
     project_dir: Path,
     already_written: dict[str, str],
 ) -> str:
-    model = _get_model(MODEL_WRITER)
-
     file_path = file_info["path"]
     file_desc = file_info.get("description", "")
     file_imports = file_info.get("imports", [])
@@ -214,8 +221,7 @@ General rules:
 Code for {file_path}:"""
 
     try:
-        response = model.generate_content(prompt)
-        code = _strip_fences(response.text)
+        code = _strip_fences(_llm_generate(prompt))
 
         full_path = project_dir / file_path
         full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -350,8 +356,6 @@ def _fix_files(
     entry_point: str,
 ) -> dict[str, str]:
 
-    model = _get_model(MODEL_PLANNER)
-
     error_file, error_line = _parse_traceback(error_output, list(file_codes.keys()))
     error_type = _classify_error(error_output)
 
@@ -412,8 +416,7 @@ Rules:
 Fixed code for {fix_path}:"""
 
         try:
-            response = model.generate_content(prompt)
-            fixed = _strip_fences(response.text)
+            fixed = _strip_fences(_llm_generate(prompt))
 
             full_path = project_dir / fix_path
             full_path.parent.mkdir(parents=True, exist_ok=True)

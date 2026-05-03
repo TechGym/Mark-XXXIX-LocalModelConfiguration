@@ -1,4 +1,6 @@
 ﻿sounddevice
+faster-whisper
+pyttsx3
 google-genai
 google-generativeai
 pillow
