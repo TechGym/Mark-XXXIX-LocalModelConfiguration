@@ -942,7 +942,7 @@ class SetupOverlay(QWidget):
         layout.addWidget(self._ollama_url)
         layout.addWidget(_lbl("Model tag", 8, color=C.TEXT_DIM,
                                align=Qt.AlignmentFlag.AlignLeft))
-        self._ollama_model = QLineEdit("dolphin-llama3:8b")
+        self._ollama_model = QLineEdit("llama3.1:8b")
         self._ollama_model.setFont(QFont("Courier New", 9))
         self._ollama_model.setFixedHeight(28)
         self._ollama_model.setStyleSheet(_le_style)
@@ -1444,6 +1444,50 @@ class MainWindow(QMainWindow):
         om_lay.addLayout(om_row)
         lay.addWidget(self._ollama_model_wrap)
 
+        self._tts_backend_wrap = QWidget()
+        self._tts_backend_wrap.setVisible(False)
+        tts_lay = QVBoxLayout(self._tts_backend_wrap)
+        tts_lay.setContentsMargins(0, 0, 0, 0)
+        tts_lay.setSpacing(4)
+        tts_lay.addWidget(_sec("VOICE OUTPUT (LOCAL)"))
+        self._tts_hint = QLabel(
+            "Ollama answers stay local; pick how spoken replies are played."
+        )
+        self._tts_hint.setFont(QFont("Courier New", 6))
+        self._tts_hint.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._tts_hint.setWordWrap(True)
+        tts_lay.addWidget(self._tts_hint)
+        self._tts_backend_combo = QComboBox()
+        self._tts_backend_combo.setFont(QFont("Courier New", 8))
+        self._tts_backend_combo.setMinimumHeight(28)
+        self._tts_backend_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: #000d12; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 6px;
+            }}
+            QComboBox:hover {{ border: 1px solid {C.BORDER_B}; }}
+        """)
+        self._tts_backend_combo.addItem("Windows (SAPI / pyttsx3)", "pyttsx3")
+        self._tts_backend_combo.addItem("Gemini neural (uses API key)", "gemini")
+        self._tts_backend_combo.currentIndexChanged.connect(self._on_tts_backend_changed)
+        tts_lay.addWidget(self._tts_backend_combo)
+        self._tts_gemini_voice_lbl = QLabel("Gemini voice")
+        self._tts_gemini_voice_lbl.setFont(QFont("Courier New", 7))
+        self._tts_gemini_voice_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        tts_lay.addWidget(self._tts_gemini_voice_lbl)
+        self._gemini_voice_combo = QComboBox()
+        self._gemini_voice_combo.setFont(QFont("Courier New", 8))
+        self._gemini_voice_combo.setMinimumHeight(28)
+        self._gemini_voice_combo.setStyleSheet(self._tts_backend_combo.styleSheet())
+        self._gemini_voice_combo.currentTextChanged.connect(self._on_gemini_voice_changed)
+        tts_lay.addWidget(self._gemini_voice_combo)
+        self._tts_gemini_hint = QLabel("")
+        self._tts_gemini_hint.setFont(QFont("Courier New", 6))
+        self._tts_gemini_hint.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._tts_gemini_hint.setWordWrap(True)
+        tts_lay.addWidget(self._tts_gemini_hint)
+        lay.addWidget(self._tts_backend_wrap)
+
         sep3 = QFrame()
         sep3.setFrameShape(QFrame.Shape.HLine)
         sep3.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
@@ -1553,7 +1597,7 @@ class MainWindow(QMainWindow):
                 f"Briefly tell the user you can see the file '{p.name}' "
                 f"({size}) has been uploaded and ask what they'd like to do with it."
             )
-            threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
+            self.on_text_command(msg)
 
     def _toggle_mute(self):
         self._muted = not self._muted
@@ -1591,7 +1635,8 @@ class MainWindow(QMainWindow):
         self._input.clear()
         self._log.append_log(f"You: {txt}")
         if self.on_text_command:
-            threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
+            # Call from Qt thread; JarvisOllama uses run_coroutine_threadsafe (JarvisLive uses it too).
+            self.on_text_command(txt)
 
     def _on_ollama_attached(self, jarvis) -> None:
         self._ollama_backend = jarvis
@@ -1643,7 +1688,7 @@ class MainWindow(QMainWindow):
         os.makedirs(CONFIG_DIR, exist_ok=True)
         if use_ollama:
             o_url = "http://127.0.0.1:11434"
-            o_model = "dolphin-llama3:8b"
+            o_model = "llama3.1:8b"
             if self._overlay:
                 o_url = (self._overlay._ollama_url.text().strip() or o_url)
                 o_model = (self._overlay._ollama_model.text().strip() or o_model)
@@ -1695,6 +1740,7 @@ class MainWindow(QMainWindow):
             )
         )
         self._refresh_ollama_models_async()
+        self._try_show_ollama_tts_controls()
 
     def _refresh_ollama_models_async(self) -> None:
         def work() -> None:
@@ -1704,7 +1750,7 @@ class MainWindow(QMainWindow):
                 names = list_ollama_models()
                 cur = get_ollama_model()
             except Exception:
-                names, cur = [], "dolphin-llama3:8b"
+                names, cur = [], "llama3.1:8b"
             self._ollama_models_sig.emit(names, cur)
 
         threading.Thread(target=work, daemon=True).start()
@@ -1744,6 +1790,120 @@ class MainWindow(QMainWindow):
         except OSError:
             return
         self._log.append_log(f"SYS: Ollama model → {model}")
+
+    def _try_show_ollama_tts_controls(self) -> None:
+        try:
+            from mark_llm_settings import (
+                get_gemini_api_key,
+                get_gemini_live_voice_name,
+                get_local_tts_backend,
+                is_ollama_mode,
+                list_gemini_tts_voice_names,
+            )
+        except ImportError:
+            return
+        if not hasattr(self, "_tts_backend_wrap"):
+            return
+        if not is_ollama_mode():
+            self._tts_backend_wrap.setVisible(False)
+            return
+        self._tts_backend_wrap.setVisible(True)
+        self._tts_backend_combo.blockSignals(True)
+        self._gemini_voice_combo.blockSignals(True)
+        backend = get_local_tts_backend()
+        self._tts_backend_combo.setCurrentIndex(1 if backend == "gemini" else 0)
+        self._gemini_voice_combo.clear()
+        for name in list_gemini_tts_voice_names():
+            self._gemini_voice_combo.addItem(name)
+        cur = get_gemini_live_voice_name()
+        vi = self._gemini_voice_combo.findText(cur)
+        if vi >= 0:
+            self._gemini_voice_combo.setCurrentIndex(vi)
+        elif self._gemini_voice_combo.count() > 0:
+            self._gemini_voice_combo.setCurrentIndex(0)
+        self._tts_backend_combo.blockSignals(False)
+        self._gemini_voice_combo.blockSignals(False)
+        self._update_tts_widgets_enabled(get_gemini_api_key())
+        env_tb = os.environ.get("MARK_TTS_BACKEND", "").strip()
+        base = (
+            "Ollama answers stay local; pick how spoken replies are played."
+        )
+        if env_tb:
+            base += (
+                f" Note: MARK_TTS_BACKEND={env_tb!r} in the environment overrides "
+                "``tts_backend`` in api_keys.json — spoken output may not match this panel."
+            )
+        self._tts_hint.setText(base)
+
+    def _update_tts_widgets_enabled(self, gemini_key: str | None = None) -> None:
+        if not hasattr(self, "_gemini_voice_combo"):
+            return
+        try:
+            from mark_llm_settings import get_gemini_api_key
+        except ImportError:
+            return
+        key = gemini_key if gemini_key is not None else get_gemini_api_key()
+        use_gem = self._tts_backend_combo.currentIndex() == 1
+        self._gemini_voice_combo.setEnabled(use_gem)
+        self._tts_gemini_voice_lbl.setEnabled(use_gem)
+        if use_gem:
+            self._tts_gemini_hint.setText(
+                (
+                    "Uses ``gemini_api_key`` for speech only; chat stays on Ollama. "
+                    "If you still hear Windows SAPI, check the terminal: Gemini TTS may "
+                    "return 429 (free-tier quota) and the app falls back to Zira."
+                )
+                if key
+                else "Set ``gemini_api_key`` in api_keys.json (same as full Gemini mode)."
+            )
+        else:
+            self._tts_gemini_hint.setText(
+                "Optional: ``tts_voice_substring`` in api_keys.json for SAPI voice."
+                + (
+                    " You have ``gemini_api_key`` — select **Gemini neural** above to use the Gemini voice list."
+                    if key
+                    else ""
+                )
+            )
+
+    def _on_tts_backend_changed(self, _idx: int) -> None:
+        self._update_tts_widgets_enabled()
+        self._persist_tts_settings()
+
+    def _on_gemini_voice_changed(self, _text: str) -> None:
+        # Picking a Gemini prebuilt voice implies Gemini TTS when a key exists;
+        # otherwise the voice list has no effect and SAPI (e.g. Zira) still speaks.
+        try:
+            from mark_llm_settings import get_gemini_api_key
+        except ImportError:
+            self._persist_tts_settings()
+            return
+        if get_gemini_api_key() and self._tts_backend_combo.currentIndex() == 0:
+            self._tts_backend_combo.blockSignals(True)
+            self._tts_backend_combo.setCurrentIndex(1)
+            self._tts_backend_combo.blockSignals(False)
+            self._update_tts_widgets_enabled(get_gemini_api_key())
+        self._persist_tts_settings()
+
+    def _persist_tts_settings(self) -> None:
+        if not API_FILE.exists():
+            return
+        try:
+            data = json.loads(API_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        data["tts_backend"] = (
+            "gemini" if self._tts_backend_combo.currentIndex() == 1 else "pyttsx3"
+        )
+        v = (self._gemini_voice_combo.currentText() or "").strip()
+        if v:
+            data["gemini_live_voice"] = v
+        try:
+            API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+        except OSError:
+            return
+        extra = f", Gemini voice={v}" if data["tts_backend"] == "gemini" else ""
+        self._log.append_log(f"SYS: Voice output → {data['tts_backend']}{extra}")
 
 
 class _RootShim:

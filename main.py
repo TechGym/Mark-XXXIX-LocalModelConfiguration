@@ -6,6 +6,8 @@ import sys
 import traceback
 from pathlib import Path
 
+import os
+
 import sounddevice as sd
 from google import genai
 from google.genai import types
@@ -15,7 +17,7 @@ from memory.memory_manager import (
 )
 
 from jarvis_tool_runner import run_jarvis_tool
-from mark_llm_settings import is_ollama_mode
+from mark_llm_settings import get_gemini_live_voice_name, is_ollama_mode
 
 
 def get_base_dir():
@@ -32,6 +34,124 @@ CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+
+
+def _first_output_device_index_containing(substring: str) -> int | None:
+    """First PortAudio host output whose name contains ``substring`` (case-insensitive)."""
+    needle = (substring or "").strip().lower()
+    if not needle:
+        return None
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None
+    for i, d in enumerate(devices):
+        try:
+            if int(d.get("max_output_channels") or 0) < 1:
+                continue
+        except (TypeError, ValueError):
+            continue
+        name = (d.get("name") or "").lower()
+        if needle in name:
+            return int(i)
+    return None
+
+
+def _audio_prefs_from_api_keys() -> tuple[int | None, str | None, bool]:
+    """Optional ``audio_output_device``, ``audio_output_name``, ``audio_prefer_bluetooth``."""
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None, None, False
+    if not isinstance(data, dict):
+        return None, None, False
+    dev = data.get("audio_output_device")
+    out_i: int | None = None
+    if isinstance(dev, int):
+        out_i = dev
+    elif isinstance(dev, str) and dev.strip().isdigit():
+        out_i = int(dev.strip())
+    name = data.get("audio_output_name")
+    out_n = name.strip() if isinstance(name, str) and name.strip() else None
+    pref = data.get("audio_prefer_bluetooth")
+    prefer_bt = pref in (True, 1, "1", "true", "yes", "on")
+    return out_i, out_n, prefer_bt
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _gemini_playback_device():
+    """
+    PortAudio output for Gemini Live PCM (``sounddevice.RawOutputStream``).
+
+    Resolution order:
+
+    1. ``MARK_SD_OUTPUT_DEVICE`` / ``MARK_AUDIO_OUTPUT`` — integer index, or a
+       non-numeric string passed through to sounddevice (host-specific).
+    2. ``MARK_AUDIO_OUTPUT_NAME`` / ``MARK_SD_OUTPUT_NAME`` — substring matched
+       against output device names (useful for **Bluetooth** speakers that are
+       not Windows' default PortAudio device).
+    3. ``config/api_keys.json``: ``audio_output_device`` (int),
+       ``audio_output_name`` (substring), or ``audio_prefer_bluetooth`` (bool).
+    4. ``MARK_AUDIO_PREFER_BLUETOOTH`` — pick first output whose name contains
+       ``bluetooth`` (case-insensitive).
+
+    **Local Ollama TTS** (``pyttsx3``) always follows **Windows' default playback
+    device** in Settings → Sound; set your Bluetooth speaker as default there for
+    voice replies, or use only the Gemini Live path for speaker routing via the
+    options above.
+    """
+    raw = os.environ.get("MARK_SD_OUTPUT_DEVICE", os.environ.get("MARK_AUDIO_OUTPUT", "")).strip()
+    if raw:
+        try:
+            idx = int(raw)
+            print(f"[JARVIS] 🔊 Output pick: env index {idx}")
+            return idx
+        except ValueError:
+            print(f"[JARVIS] 🔊 Output pick: env string selector {raw!r}")
+            return raw
+
+    for env_key in ("MARK_AUDIO_OUTPUT_NAME", "MARK_SD_OUTPUT_NAME"):
+        sub = os.environ.get(env_key, "").strip()
+        if not sub:
+            continue
+        idx = _first_output_device_index_containing(sub)
+        if idx is not None:
+            print(f"[JARVIS] 🔊 Output pick: {env_key} matched → index {idx}")
+            return idx
+        print(f"[JARVIS] 🔊 No output device matched {env_key}={sub!r}")
+
+    cfg_i, cfg_n, cfg_bt = _audio_prefs_from_api_keys()
+    if cfg_i is not None:
+        print(f"[JARVIS] 🔊 Output pick: api_keys.json audio_output_device={cfg_i}")
+        return cfg_i
+    if cfg_n:
+        idx = _first_output_device_index_containing(cfg_n)
+        if idx is not None:
+            print(f"[JARVIS] 🔊 Output pick: api_keys.json audio_output_name={cfg_n!r} → index {idx}")
+            return idx
+        print(f"[JARVIS] 🔊 api_keys audio_output_name={cfg_n!r} matched no device.")
+
+    if cfg_bt or _truthy_env("MARK_AUDIO_PREFER_BLUETOOTH"):
+        idx = _first_output_device_index_containing("bluetooth")
+        if idx is not None:
+            who = "api_keys audio_prefer_bluetooth" if cfg_bt else "MARK_AUDIO_PREFER_BLUETOOTH"
+            print(f"[JARVIS] 🔊 Output pick: {who} → index {idx}")
+            return idx
+        print("[JARVIS] 🔊 Bluetooth preference set but no output device name contains 'bluetooth'.")
+
+    print(
+        "[JARVIS] 🔊 Output pick: PortAudio default. "
+        "If Gemini voice is silent on a Bluetooth speaker, set "
+        "audio_output_name to a substring of that device in config/api_keys.json "
+        "(see device list: python -c \"import sounddevice as sd; print(sd.query_devices())\"), "
+        "or set MARK_AUDIO_OUTPUT_NAME / MARK_AUDIO_PREFER_BLUETOOTH."
+    )
+    return None
+
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -533,6 +653,7 @@ class JarvisLive:
             parts.append(mem_str)
         parts.append(sys_prompt)
 
+        voice_name = get_gemini_live_voice_name()
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
@@ -543,7 +664,7 @@ class JarvisLive:
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
+                        voice_name=voice_name
                     )
                 )
             ),
@@ -655,13 +776,31 @@ class JarvisLive:
 
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
+        dev = _gemini_playback_device()
+        try:
+            q = dev if dev is not None else sd.default.device[1]
+            info = sd.query_devices(q, "output")
+            print(f"[JARVIS] 🔊 PCM output → {info.get('name', info)!r} (device={dev!r})")
+        except Exception as e:
+            print(f"[JARVIS] 🔊 Device query failed ({e}); using device={dev!r}")
 
-        stream = sd.RawOutputStream(
-            samplerate=RECEIVE_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-        )
+        try:
+            stream = sd.RawOutputStream(
+                samplerate=RECEIVE_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=CHUNK_SIZE,
+                device=dev,
+            )
+        except Exception as e:
+            print(f"[JARVIS] 🔊 Stream open failed device={dev!r} ({e}); retrying PortAudio default.")
+            stream = sd.RawOutputStream(
+                samplerate=RECEIVE_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=CHUNK_SIZE,
+                device=None,
+            )
         stream.start()
 
         try:

@@ -26,6 +26,31 @@ def _load_config() -> dict:
         return {}
 
 
+def _normalize_ollama_base(url: str) -> str:
+    """
+    Ollama native calls use ``{base}/api/chat``. If ``ollama_url`` was pasted with
+    ``/api`` or OpenAI-style ``/v1`` suffixes, strip them so we do not POST to
+    the wrong path (often surfaces as HTTP 405).
+    """
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return "http://127.0.0.1:11434"
+    lower = u.lower()
+    for suf in (
+        "/v1/chat/completions",
+        "/v1/chat",
+        "/api/chat",
+        "/api/generate",
+        "/api/tags",
+        "/api",
+        "/v1",
+    ):
+        if lower.endswith(suf):
+            u = u[: len(u) - len(suf)].rstrip("/")
+            lower = u.lower()
+    return u or "http://127.0.0.1:11434"
+
+
 def is_ollama_mode() -> bool:
     """True when Mark should use local Ollama instead of Gemini."""
     env = os.environ.get("MARK_LLM_PROVIDER", "").strip().lower()
@@ -40,12 +65,13 @@ def is_ollama_mode() -> bool:
 
 
 def get_ollama_url() -> str:
-    return (
+    raw = (
         os.environ.get("MARK_OLLAMA_URL", "").strip()
         or os.environ.get("ALETHEON_LLM_ASSIST_OLLAMA_URL", "").strip()
         or (_load_config().get("ollama_url") or "").strip()
         or "http://127.0.0.1:11434"
-    ).rstrip("/")
+    )
+    return _normalize_ollama_base(raw)
 
 
 def get_ollama_model() -> str:
@@ -53,7 +79,7 @@ def get_ollama_model() -> str:
         os.environ.get("MARK_OLLAMA_MODEL", "").strip()
         or os.environ.get("ALETHEON_LLM_ASSIST_OLLAMA_MODEL", "").strip()
         or (_load_config().get("ollama_model") or "").strip()
-        or "dolphin-llama3:8b"
+        or "llama3.1:8b"
     )
 
 
@@ -69,6 +95,119 @@ def get_ollama_vision_model() -> str:
         or (_load_config().get("ollama_vision_model") or "").strip()
     )
     return v or "llava"
+
+
+def get_gemini_live_voice_name() -> str:
+    """
+    Prebuilt Gemini voice id for **Live** sessions and for **local Gemini TTS**
+    (when ``tts_backend`` is ``gemini``).
+
+    Override with ``MARK_GEMINI_VOICE`` / ``GEMINI_LIVE_VOICE``, or
+    ``gemini_live_voice`` / ``gemini_voice_name`` in ``config/api_keys.json``.
+    Default ``Charon``. See Gemini speech docs for the full list.
+    """
+    v = (
+        os.environ.get("MARK_GEMINI_VOICE", "").strip()
+        or os.environ.get("GEMINI_LIVE_VOICE", "").strip()
+        or (_load_config().get("gemini_live_voice") or "").strip()
+        or (_load_config().get("gemini_voice_name") or "").strip()
+    )
+    return v or "Charon"
+
+
+def get_local_tts_voice_substring() -> str | None:
+    """
+    Substring matched against Windows SAPI voice **display names** for ``pyttsx3``.
+
+    First voice whose ``name`` contains this substring (case-insensitive) is used.
+    Set ``MARK_TTS_VOICE``, or ``tts_voice_substring`` / ``local_tts_voice`` in
+    ``config/api_keys.json``. Example substrings: ``David``, ``Zira``, ``Mark``.
+    """
+    v = (
+        os.environ.get("MARK_TTS_VOICE", "").strip()
+        or (_load_config().get("tts_voice_substring") or "").strip()
+        or (_load_config().get("local_tts_voice") or "").strip()
+    )
+    return v or None
+
+
+# Prebuilt Gemini TTS / Live voice names (see Gemini speech generation docs).
+GEMINI_TTS_VOICE_NAMES: tuple[str, ...] = (
+    "Achernar",
+    "Achird",
+    "Algenib",
+    "Algieba",
+    "Alnilam",
+    "Aoede",
+    "Autonoe",
+    "Callirrhoe",
+    "Charon",
+    "Despina",
+    "Enceladus",
+    "Erinome",
+    "Fenrir",
+    "Gacrux",
+    "Iapetus",
+    "Kore",
+    "Laomedeia",
+    "Leda",
+    "Orus",
+    "Puck",
+    "Pulcherrima",
+    "Rasalgethi",
+    "Sadachbia",
+    "Sadaltager",
+    "Schedar",
+    "Sulafat",
+    "Umbriel",
+    "Vindemiatrix",
+    "Zephyr",
+    "Zubenelgenubi",
+)
+
+
+def list_gemini_tts_voice_names() -> list[str]:
+    return list(GEMINI_TTS_VOICE_NAMES)
+
+
+def get_gemini_api_key() -> str:
+    """Same key as full Gemini mode: ``gemini_api_key`` in ``api_keys.json`` (or env)."""
+    return (
+        os.environ.get("GEMINI_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_API_KEY", "").strip()
+        or (_load_config().get("gemini_api_key") or "").strip()
+    )
+
+
+def get_local_tts_backend() -> str:
+    """
+    Local reply speech: ``pyttsx3`` (Windows SAPI) or ``gemini`` (Gemini TTS HTTP,
+    uses ``gemini_api_key`` only for synthesis while chat stays on Ollama).
+
+    ``MARK_TTS_BACKEND`` or ``tts_backend`` in ``api_keys.json``: ``gemini`` / ``pyttsx3``.
+    """
+    v = (
+        os.environ.get("MARK_TTS_BACKEND", "").strip().lower()
+        or (_load_config().get("tts_backend") or "").strip().lower()
+    )
+    if v in ("gemini", "google"):
+        return "gemini"
+    return "pyttsx3"
+
+
+def get_gemini_tts_model() -> str:
+    """
+    Gemini TTS model id for ``generate_content`` (see Google speech docs).
+
+    Default ``gemini-3.1-flash-tts-preview`` — older ``gemini-2.5-flash-preview-tts`` /
+    ``gemini-2.5-flash-tts`` often share a **small free-tier quota**; 429s there fall
+    back to Windows SAPI unless you set ``gemini_tts_model`` / ``MARK_GEMINI_TTS_MODEL``.
+    """
+    v = (
+        os.environ.get("MARK_GEMINI_TTS_MODEL", "").strip()
+        or (_load_config().get("gemini_tts_model") or "").strip()
+    )
+    return v or "gemini-3.1-flash-tts-preview"
 
 
 def ollama_model_env_locked() -> bool:
@@ -121,6 +260,20 @@ def ollama_chat(
     if tools:
         payload["tools"] = tools
     resp = requests.post(url, json=payload, timeout=timeout)
+    if not resp.ok:
+        body = (resp.text or "").strip()[:1200]
+        print(f"[OLLAMA] HTTP {resp.status_code} {url}\n{body}")
+        if resp.status_code == 405:
+            print(
+                "[OLLAMA] HTTP 405: /api/chat expects POST from the app, not GET in a browser. "
+                "If this persists, check ollama_url is only the daemon root "
+                "(e.g. http://127.0.0.1:11434) and that Ollama is running on that port."
+            )
+        if resp.status_code >= 500:
+            print(
+                "[OLLAMA] HTTP 5xx: check `ollama ps`, GPU VRAM, and `ollama logs`; "
+                "try `ollama pull` again or a smaller model if OOM."
+            )
     resp.raise_for_status()
     return resp.json()
 

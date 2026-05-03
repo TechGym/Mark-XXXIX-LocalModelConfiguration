@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import traceback
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from memory.memory_manager import update_memory
 
@@ -284,3 +285,174 @@ def parse_tool_arguments(raw: object) -> dict:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _balanced_json_slice(text: str, open_brace: int) -> Optional[str]:
+    """Return the JSON object starting at ``open_brace``, or ``None`` if unbalanced."""
+    if open_brace < 0 or open_brace >= len(text) or text[open_brace] != "{":
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    quote_char = ""
+    for j in range(open_brace, len(text)):
+        ch = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == quote_char:
+                in_str = False
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            quote_char = ch
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace : j + 1]
+    return None
+
+
+def synthetic_tool_calls_from_text(
+    content: str,
+    *,
+    valid_names: set[str],
+) -> list[dict]:
+    """
+    Some local models print tool intent in ``message.content`` instead of Ollama
+    ``tool_calls``. Supported whole-message shapes:
+
+    - ``open_app({"app_name": "Notepad"})``
+    - ``open_app {"app_name": "Notepad"}`` (space instead of parentheses)
+    - ``{"name": "open_app", "arguments": {"app_name": "Notepad"}}``
+    - A tool line buried after prose (each non-empty line is tried).
+    - JSON starting mid-string (e.g. one line with text then ``{"name":...}``).
+    """
+    s = (content or "").strip()
+    if not s or len(s) > 12_000:
+        return []
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```\s*$", "", s).strip()
+
+    def _one(name: str, args: dict) -> list[dict]:
+        if name not in valid_names or not isinstance(args, dict):
+            return []
+        return [
+            {
+                "id": "from_model_text",
+                "function": {
+                    "name": name,
+                    "arguments": args,
+                },
+            }
+        ]
+
+    def _from_parsed_tool_json(obj: object) -> list[dict]:
+        """OpenAI-style ``{"name": "...", "arguments": {...}}`` (or a one-element list)."""
+        if isinstance(obj, dict):
+            fn_block = obj.get("function")
+            if isinstance(fn_block, dict) and not isinstance(obj.get("name"), str):
+                name = fn_block.get("name")
+                raw_args = fn_block.get("arguments")
+            else:
+                name = obj.get("name") or obj.get("function") or obj.get("tool_name")
+                if isinstance(name, dict):
+                    name = name.get("name")
+                raw_args = obj.get("arguments") or obj.get("parameters") or obj.get("args")
+            if isinstance(name, str):
+                if isinstance(raw_args, str):
+                    args = parse_tool_arguments(raw_args)
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    args = {}
+                if isinstance(args, dict) and args:
+                    return _one(name, args)
+        if isinstance(obj, list) and len(obj) == 1 and isinstance(obj[0], dict):
+            return _from_parsed_tool_json(obj[0])
+        return []
+
+    # JSON: whole message is a single tool object
+    if s.lstrip().startswith("{"):
+        try:
+            obj_whole = json.loads(s)
+        except json.JSONDecodeError:
+            obj_whole = None
+        got = _from_parsed_tool_json(obj_whole)
+        if got:
+            return got
+
+    _PAREN_TOOL = re.compile(
+        r"^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*\([ \t]*(\{[\s\S]*\})[ \t]*\)[ \t]*$"
+    )
+
+    def _try_line(line: str) -> list[dict]:
+        line = (line or "").strip()
+        if not line:
+            return []
+        if line.lstrip().startswith("{"):
+            try:
+                obj_line = json.loads(line)
+            except json.JSONDecodeError:
+                obj_line = None
+            got = _from_parsed_tool_json(obj_line)
+            if got:
+                return got
+        m_p = _PAREN_TOOL.match(line)
+        if m_p:
+            name, json_blob = m_p.group(1), m_p.group(2)
+            if name in valid_names:
+                args = parse_tool_arguments(json_blob)
+                if isinstance(args, dict) and args:
+                    got = _one(name, args)
+                    if got:
+                        return got
+        for name in sorted(valid_names, key=len, reverse=True):
+            if not line.startswith(name):
+                continue
+            n = len(name)
+            if n < len(line) and line[n] not in " \t\n({":
+                continue
+            rest = line[n:].lstrip()
+            if not rest.startswith("{"):
+                continue
+            brace = line.find("{", n)
+            blob = _balanced_json_slice(line, brace)
+            if not blob:
+                continue
+            args = parse_tool_arguments(blob)
+            if isinstance(args, dict) and args:
+                got = _one(name, args)
+                if got:
+                    return got
+        return []
+
+    candidates: list[str] = [s]
+    for ln in s.splitlines():
+        t = ln.strip()
+        if t and t not in candidates:
+            candidates.append(t)
+    for cand in candidates:
+        got = _try_line(cand)
+        if got:
+            return got
+    for i, ch in enumerate(s):
+        if ch != "{":
+            continue
+        blob = _balanced_json_slice(s, i)
+        if not blob or len(blob) < 12:
+            continue
+        try:
+            parsed = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        got = _from_parsed_tool_json(parsed)
+        if got:
+            return got
+    return []

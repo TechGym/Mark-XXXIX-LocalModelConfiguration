@@ -406,13 +406,67 @@ class _BrowserSession:
                 pass
         self._context = self._page = None
 
+    async def _close_context_only(self) -> None:
+        """Drop browser context but keep Playwright running (recover from broken sessions)."""
+        self._page = None
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
+
+    async def _pick_or_new_page(self) -> Page:
+        """
+        Persistent Chromium often opens an initial tab asynchronously; calling
+        ``new_page()`` too early can raise ``Target page, ...``. Prefer an existing
+        live tab, poll briefly for the default tab, then retry ``new_page()``.
+        """
+        assert self._context is not None
+        loop   = asyncio.get_event_loop()
+        poll_t = loop.time() + 6.0
+        while loop.time() < poll_t:
+            for p in list(self._context.pages):
+                try:
+                    if p is not None and not p.is_closed():
+                        return p
+                except Exception:
+                    continue
+            # Default tab not attached yet, or only dead handles — wait and retry.
+            await asyncio.sleep(0.12)
+
+        last_err: Optional[BaseException] = None
+        for attempt in range(8):
+            try:
+                return await self._context.new_page()
+            except Exception as e:
+                last_err = e
+                if not self._is_playwright_target_error(e):
+                    raise
+                await asyncio.sleep(0.18 * (attempt + 1))
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("_pick_or_new_page: exhausted retries")
+
     async def _launch(self):
         """
         Tarayıcıyı gerçek kullanıcı profiliyle başlatır.
         Context zaten açıksa hiçbir şey yapmaz.
         """
         if self._context is not None:
-            return
+            try:
+                _ = self._context.pages
+            except Exception:
+                await self._close_context_only()
+            else:
+                if self._page is not None and not self._page.is_closed():
+                    return
+                try:
+                    self._page = await self._pick_or_new_page()
+                    return
+                except Exception as e:
+                    print(f"[Browser] Could not attach page on existing context ({e}); relaunching.")
+                    await self._close_context_only()
 
         if self._spec is None:
             raise RuntimeError(
@@ -444,8 +498,8 @@ class _BrowserSession:
                 Path(jarvis).mkdir(parents=True, exist_ok=True)
                 self._context = await engine_obj.launch_persistent_context(jarvis, **kwargs)
 
-            await asyncio.sleep(0.5)  
-            self._page = await self._context.new_page()
+            await asyncio.sleep(0.5)
+            self._page = await self._pick_or_new_page()
             print(f"[Browser] ✅ Firefox launched")
             return
 
@@ -460,7 +514,7 @@ class _BrowserSession:
             }
             self._context = await engine_obj.launch_persistent_context(safari_profile, **kwargs)
             await asyncio.sleep(0.5)
-            self._page = await self._context.new_page()
+            self._page = await self._pick_or_new_page()
             print(f"[Browser] ✅ Safari launched")
             return
 
@@ -491,10 +545,17 @@ class _BrowserSession:
             + (f" @ {exe}" if exe else "")
         )
 
+        post_launch_wait = 1.0 if self.browser_name in ("edge", "brave") else 0.5
+
         try:
             self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
-            await asyncio.sleep(0.5) 
-            self._page = await self._context.new_page()
+            await asyncio.sleep(post_launch_wait)
+            try:
+                self._page = await self._pick_or_new_page()
+            except Exception as pe:
+                print(f"[Browser] ⚠️  First page attach failed ({pe}); retrying JARVIS profile")
+                await self._close_context_only()
+                raise RuntimeError(str(pe)) from pe
             print(f"[Browser] ✅ Launched [{label}] profile={profile}")
             return
         except Exception as e:
@@ -506,19 +567,38 @@ class _BrowserSession:
 
         try:
             self._context = await engine_obj.launch_persistent_context(jarvis_profile, **kwargs)
-            await asyncio.sleep(0.5)
-            self._page = await self._context.new_page()
+            await asyncio.sleep(post_launch_wait)
+            self._page = await self._pick_or_new_page()
             print(f"[Browser] ✅ Launched [{label}] with JARVIS profile")
         except Exception as e2:
             raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
 
 
+    def _is_playwright_target_error(self, err: BaseException) -> bool:
+        s = str(err).lower()
+        return (
+            "target page" in s
+            or "has been closed" in s
+            or "browser has been closed" in s
+            or ("context" in s and "closed" in s)
+        )
+
     async def _get_page(self) -> Page:
         await self._launch()
-        # If somehow page got closed, open a fresh one
-        if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
-            await asyncio.sleep(0.2)
+        if self._page is not None and not self._page.is_closed():
+            return self._page
+        assert self._context is not None
+        try:
+            self._page = await self._pick_or_new_page()
+        except Exception as e:
+            if self._is_playwright_target_error(e):
+                print(f"[Browser] Session stale ({e}); resetting and relaunching.")
+                await self._close_context_only()
+                await self._launch()
+                self._page = await self._pick_or_new_page()
+            else:
+                raise
+        await asyncio.sleep(0.2)
         return self._page
 
     async def go_to(self, url: str) -> str:
@@ -543,7 +623,15 @@ class _BrowserSession:
         if result_url in ("about:blank", "", None, prev_url) and prev_url in ("about:blank", "", None):
             print(f"[Browser] Still blank after goto — retrying on new tab: {url}")
             try:
-                new_page   = await self._context.new_page()
+                try:
+                    new_page = await self._context.new_page()
+                except Exception as ne:
+                    if self._is_playwright_target_error(ne):
+                        await self._close_context_only()
+                        await self._launch()
+                        new_page = await self._pick_or_new_page()
+                    else:
+                        raise
                 self._page = new_page
                 result_url = await _do_goto(new_page)
             except Exception as e:
@@ -681,7 +769,15 @@ class _BrowserSession:
     async def new_tab(self, url: str = "") -> str:
         page = await self._get_page()
         ctx  = page.context
-        new  = await ctx.new_page()
+        try:
+            new = await ctx.new_page()
+        except Exception as ne:
+            if self._is_playwright_target_error(ne):
+                await self._close_context_only()
+                await self._launch()
+                new = await self._pick_or_new_page()
+            else:
+                raise
         self._page = new
         if url:
             return await self.go_to(url)

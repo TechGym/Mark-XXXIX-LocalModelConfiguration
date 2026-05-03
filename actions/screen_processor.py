@@ -37,6 +37,9 @@ except ImportError:
 from google import genai
 from google.genai import types as gtypes
 
+from mark_llm_settings import get_gemini_live_voice_name
+
+
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
@@ -257,6 +260,7 @@ class _VisionSession:
             api_key=_get_api_key(),
             http_options={"api_version": "v1beta"},
         )
+        _vn = get_gemini_live_voice_name()
         config = gtypes.LiveConnectConfig(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
@@ -264,7 +268,7 @@ class _VisionSession:
             speech_config=gtypes.SpeechConfig(
                 voice_config=gtypes.VoiceConfig(
                     prebuilt_voice_config=gtypes.PrebuiltVoiceConfig(
-                        voice_name="Charon"
+                        voice_name=_vn
                     )
                 )
             ),
@@ -383,11 +387,9 @@ def _ollama_vision_tts(text: str) -> None:
     if not (text or "").strip():
         return
     try:
-        import pyttsx3
+        from mark_tts import speak_mark_tts
 
-        e = pyttsx3.init()
-        e.say(text)
-        e.runAndWait()
+        speak_mark_tts(text)
     except Exception as ex:
         print(f"[Vision] TTS (Ollama): {ex}")
 
