@@ -105,7 +105,7 @@ This fork adds a complete **local stack** alongside the original Gemini Live pat
 4. Pick a **Gemini voice** (e.g. Kore, Charon). That sets **`gemini_live_voice`**.
 5. Restart **`python main.py`** after hand-editing JSON if you bypass the UI.
 
-**Config keys (local speech):** `tts_backend` (`gemini` | `pyttsx3`), `gemini_live_voice`, optional `gemini_tts_model` (default in code is **`gemini-3.1-flash-tts-preview`**; override with **`MARK_GEMINI_TTS_MODEL`**), optional `tts_voice_substring` for SAPI when on Windows mode.
+**Config keys (local speech):** `tts_backend` (`gemini` | `pyttsx3`), `gemini_live_voice`, optional `gemini_tts_model` (default **`gemini-2.5-flash-preview-tts`**, with automatic retry on 429 to **`gemini-3.1-flash-tts-preview`**; override with **`MARK_GEMINI_TTS_MODEL`**), optional `tts_voice_substring` for SAPI when on Windows mode.
 
 ### Gemini TTS quotas and billing
 

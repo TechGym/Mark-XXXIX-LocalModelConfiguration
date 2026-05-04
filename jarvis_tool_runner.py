@@ -42,11 +42,15 @@ async def run_jarvis_tool(
     speak: SpeakFn,
     speak_error: SpeakErrFn,
     loop: asyncio.AbstractEventLoop,
+    speak_from_tools: bool = True,
 ) -> dict[str, Any]:
     """
     Execute one JARVIS tool by name.
 
     Returns a dict: ``{"result": str|...}`` or ``{"result": "ok", "silent": True}`` for save_memory.
+
+    ``speak_from_tools``: when False, tools that would TTS (e.g. ``weather_report``) stay silent
+    so the host can speak only the model follow-up (avoids double audio on local Ollama).
     """
     print(f"[JARVIS] 🔧 {name}  {args}")
     ui.set_state("THINKING")
@@ -72,8 +76,12 @@ async def run_jarvis_tool(
             result = r or f"Opened {args.get('app_name')}."
 
         elif name == "weather_report":
+            tool_speak = speak if speak_from_tools else None
             r = await loop.run_in_executor(
-                None, lambda: weather_action(parameters=args, player=ui)
+                None,
+                lambda: weather_action(
+                    parameters=args, player=ui, speak=tool_speak
+                ),
             )
             result = r or "Weather delivered."
 
@@ -318,6 +326,209 @@ def _balanced_json_slice(text: str, open_brace: int) -> Optional[str]:
     return None
 
 
+def _same_line_prefix_before_brace(text: str, open_brace_idx: int) -> str:
+    """Text on the same line as ``text[open_brace_idx] == '{'``, before that brace."""
+    if open_brace_idx < 0 or open_brace_idx > len(text):
+        return ""
+    line_start = text.rfind("\n", 0, open_brace_idx) + 1
+    return text[line_start:open_brace_idx]
+
+
+_STRICT_MULTILINE_SYNTHETIC = frozenset(
+    {"send_message", "open_app", "weather_report"}
+)
+# OpenAI-style JSON tools with ``"arguments": {}`` — empty dict is falsy but valid here.
+_ALLOW_EMPTY_SYNTHETIC_JSON_ARGS = frozenset({"weather_report"})
+
+# Strip common PTT phrasing so we can compare the user's real topic to the model's query.
+_DISTILL_PREFIX_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Must consume at least one character — avoid a zero-width match on ``^`` alone.
+    re.compile(r"(?i)^\s*(?:please\s+|can\s+you\s+|could\s+you\s+|will\s+you\s+)+"),
+    # "Use web search for" / "Use the web search for" (not only "Use the web …").
+    re.compile(
+        r"(?i)^\s*(?:use\s+(?:the\s+)?)?web\s*search\s*,?\s*(for|to|about)\s+"
+    ),
+    re.compile(r"(?i)^\s*do\s+a\s+web\s*search\s+(about|for|on)\s+"),
+    re.compile(r"(?i)^\s*search\s+the\s+web\s*,?\s*(for|on)?\s*"),
+    re.compile(r"(?i)^\s*search\s+"),
+    re.compile(r"(?i)^\s*look\s+up\s+"),
+    re.compile(r"(?i)^\s*google\s+"),
+)
+
+_STOP_SEARCH_TOKENS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "you",
+        "any",
+        "use",
+        "web",
+        "search",
+        "today",
+        "news",
+        "headline",
+        "headlines",
+        "about",
+        "latest",
+        "some",
+        "into",
+        "pull",
+        "article",
+        "articles",
+        "developments",
+        "recent",
+        "with",
+        "from",
+        "that",
+        "this",
+        "have",
+        "been",
+        "there",
+        "doesnt",
+        "dont",
+    }
+)
+
+_BROAD_NEWS_HINTS = (
+    "top us news",
+    "top news today",
+    "latest news",
+    "headlines today",
+    "breaking news",
+    "us news today",
+    "national news",
+)
+
+
+def distill_user_search_intent(user_text: str) -> str:
+    """Remove leading 'web search for …' style boilerplate from the user line."""
+    s = (user_text or "").strip()
+    if not s:
+        return ""
+    changed = True
+    guard = 0
+    while changed and s and guard < 12:
+        guard += 1
+        changed = False
+        for pat in _DISTILL_PREFIX_PATTERNS:
+            ns, nsub = pat.subn("", s, count=1)
+            if nsub:
+                s = ns.strip()
+                changed = True
+                break
+    s = s.strip().rstrip("?.!").strip()
+    return s[:280]
+
+
+def _meaningful_tokens(text: str) -> set[str]:
+    return {
+        t.lower()
+        for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9'.-]{2,}", text or "")
+        if t.lower() not in _STOP_SEARCH_TOKENS
+    }
+
+
+def _is_broad_news_query(q_lower: str) -> bool:
+    return any(h in q_lower for h in _BROAD_NEWS_HINTS)
+
+
+def refine_web_search_query(user_text: str, model_query: str) -> str:
+    """If the model picked a generic news query but the user named a topic, prefer the user."""
+    mq = (model_query or "").strip()
+    distilled = distill_user_search_intent(user_text or "")
+    if not distilled:
+        return mq
+    if not mq:
+        return distilled[:280]
+    mq_l = mq.lower()
+    d_toks = _meaningful_tokens(distilled)
+    m_toks = _meaningful_tokens(mq)
+    if not d_toks:
+        return mq
+    missing = d_toks - m_toks
+    if missing and (_is_broad_news_query(mq_l) or len(missing) >= 2):
+        return distilled[:280]
+    return mq
+
+
+def apply_site_operator_from_user_request(user_text: str, query: str) -> str:
+    """Add site: when the user asked for a specific outlet."""
+    u = user_text or ""
+    ul = u.lower()
+    q = (query or "").strip()
+    if not q or "site:" in q.lower():
+        return q
+    if "cnn.com" in ul or re.search(r"\bcnn\s*\.\s*com\b", u, re.I):
+        q_body = re.sub(r"(?i)^\s*cnn\.com\s+", "", q).strip()
+        return f"site:cnn.com {q_body}"[:280]
+    if "apnews.com" in ul or "apnews" in ul or re.search(r"\bap\s+news\b", u, re.I):
+        q_body = re.sub(r"(?i)^\s*apnews\.com\s+", "", q).strip()
+        return f"site:apnews.com {q_body}"[:280]
+    if re.search(r"\breuters\b", ul):
+        q_body = re.sub(r"(?i)^\s*reuters\.com\s+", "", q).strip()
+        return f"site:reuters.com {q_body}"[:280]
+    return q
+
+
+def refine_web_search_args(user_text: str, args: dict) -> dict:
+    """Blend user intent + optional site: hint into web_search parameters."""
+    if not isinstance(args, dict):
+        return args
+    q0 = (args.get("query") or "").strip()
+    u = (user_text or "").strip()
+    if not u:
+        return args
+    q1 = refine_web_search_query(u, q0)
+    q2 = apply_site_operator_from_user_request(u, q1)
+    if q2 == q0:
+        return args
+    print(f"[JARVIS] web_search query refined: {q0!r} -> {q2!r}")
+    out = dict(args)
+    out["query"] = q2
+    return out
+
+
+def _line_smells_like_chat_prose(line: str) -> bool:
+    """True for a normal sentence line (not JSON / not ``tool_name(``)."""
+    t = (line or "").strip()
+    if len(t) < 8:
+        return False
+    if t.startswith("{") or t.startswith("["):
+        return False
+    if t.lstrip().startswith("```"):
+        return False
+    if not t[0].isalpha():
+        return False
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*[\(\{]", t):
+        return False
+    return True
+
+
+def _allow_high_risk_synthetic_tool(content: str, tool_calls: list[dict]) -> bool:
+    """
+    Block hallucinated ``send_message`` / ``open_app`` / ``weather_report`` when the
+    model mixes chat with a bare JSON tool line (e.g. user says \"Sports\" and the
+    model emits unrelated ``weather_report`` JSON). Still allow explicit
+    ``weather_report({...})`` / ``weather_report {`` lines.
+    """
+    if not tool_calls:
+        return True
+    fn = tool_calls[0].get("function") or {}
+    name = fn.get("name")
+    if name not in _STRICT_MULTILINE_SYNTHETIC:
+        return True
+    if not any(_line_smells_like_chat_prose(ln) for ln in content.splitlines()):
+        return True
+    if name == "send_message":
+        return bool(re.search(r"^\s*send_message\s*[\(\{]", content, re.MULTILINE))
+    if name == "open_app":
+        return bool(re.search(r"^\s*open_app\s*[\(\{]", content, re.MULTILINE))
+    if name == "weather_report":
+        return bool(re.search(r"^\s*weather_report\s*[\(\{]", content, re.MULTILINE))
+    return True
+
+
 def synthetic_tool_calls_from_text(
     content: str,
     *,
@@ -328,10 +539,17 @@ def synthetic_tool_calls_from_text(
     ``tool_calls``. Supported whole-message shapes:
 
     - ``open_app({"app_name": "Notepad"})``
+    - ``weather_report(city: "Miami, FL")`` or ``weather_report(city="Miami")`` (kwargs, not JSON)
+    - ``{"name": "weather_report", "arguments": {}}`` or ``weather_report({})`` (defaults / config cities)
+    - ``[web_search(query=\"...\")]`` (bracket-wrapped pseudo-call)
     - ``open_app {"app_name": "Notepad"}`` (space instead of parentheses)
     - ``{"name": "open_app", "arguments": {"app_name": "Notepad"}}``
     - A tool line buried after prose (each non-empty line is tried).
-    - JSON starting mid-string (e.g. one line with text then ``{"name":...}``).
+    - JSON starting mid-string only if the same-line text before ``{`` is short
+      (≤96 chars), so long chit-chat plus hallucinated tool JSON is ignored.
+    - ``send_message`` / ``open_app`` / ``weather_report`` are not inferred from bare
+      JSON if the reply also contains conversational lines unless a line starts with
+      an explicit ``tool_name(`` / ``tool_name {`` for that tool.
     """
     s = (content or "").strip()
     if not s or len(s) > 12_000:
@@ -372,7 +590,9 @@ def synthetic_tool_calls_from_text(
                     args = raw_args
                 else:
                     args = {}
-                if isinstance(args, dict) and args:
+                if isinstance(args, dict) and (
+                    args or name in _ALLOW_EMPTY_SYNTHETIC_JSON_ARGS
+                ):
                     return _one(name, args)
         if isinstance(obj, list) and len(obj) == 1 and isinstance(obj[0], dict):
             return _from_parsed_tool_json(obj[0])
@@ -385,11 +605,33 @@ def synthetic_tool_calls_from_text(
         except json.JSONDecodeError:
             obj_whole = None
         got = _from_parsed_tool_json(obj_whole)
-        if got:
+        if got and _allow_high_risk_synthetic_tool(s, got):
             return got
 
     _PAREN_TOOL = re.compile(
         r"^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*\([ \t]*(\{[\s\S]*\})[ \t]*\)[ \t]*$"
+    )
+    # Models often print ``web_search(query="...")`` as plain text (no JSON object).
+    _WEB_SEARCH_KWARG = re.compile(
+        r"^[ \t]*web_search[ \t]*\([ \t]*query[ \t]*[:=][ \t]*"
+        r"(['\"])(.*?)\1[ \t]*,?\s*\)[ \t]*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    # Some models wrap the pseudo-call in brackets and never emit native tool_calls.
+    _WEB_SEARCH_KWARG_BRACKET = re.compile(
+        r"^[ \t]*\[\s*web_search\s*\(\s*query\s*[:=]\s*"
+        r"(['\"])(.*?)\1\s*,?\s*\)\s*\]\s*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    # TypeScript-style ``city:`` or Python ``city=`` (not JSON) inside parentheses.
+    _WEATHER_CITY_KWARG = re.compile(
+        r"^[ \t]*weather_report[ \t]*\([ \t]*city[ \t]*[:=][ \t]*"
+        r"(['\"])(.*?)\1[ \t]*,?\s*\)[ \t]*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    _WEATHER_EMPTY_PARENS = re.compile(
+        r"^[ \t]*weather_report\s*\(\s*\)\s*$",
+        re.IGNORECASE,
     )
 
     def _try_line(line: str) -> list[dict]:
@@ -409,10 +651,37 @@ def synthetic_tool_calls_from_text(
             name, json_blob = m_p.group(1), m_p.group(2)
             if name in valid_names:
                 args = parse_tool_arguments(json_blob)
-                if isinstance(args, dict) and args:
+                if isinstance(args, dict) and (
+                    args or name in _ALLOW_EMPTY_SYNTHETIC_JSON_ARGS
+                ):
                     got = _one(name, args)
                     if got:
                         return got
+        m_ws = _WEB_SEARCH_KWARG.match(line)
+        if m_ws and "web_search" in valid_names:
+            q = (m_ws.group(2) or "").strip()
+            if q:
+                got = _one("web_search", {"query": q})
+                if got:
+                    return got
+        m_wsb = _WEB_SEARCH_KWARG_BRACKET.match(line)
+        if m_wsb and "web_search" in valid_names:
+            q = (m_wsb.group(2) or "").strip()
+            if q:
+                got = _one("web_search", {"query": q})
+                if got:
+                    return got
+        m_wx = _WEATHER_CITY_KWARG.match(line)
+        if m_wx and "weather_report" in valid_names:
+            city = (m_wx.group(2) or "").strip()
+            if city:
+                got = _one("weather_report", {"city": city})
+                if got:
+                    return got
+        if _WEATHER_EMPTY_PARENS.match(line) and "weather_report" in valid_names:
+            got = _one("weather_report", {})
+            if got:
+                return got
         for name in sorted(valid_names, key=len, reverse=True):
             if not line.startswith(name):
                 continue
@@ -427,7 +696,9 @@ def synthetic_tool_calls_from_text(
             if not blob:
                 continue
             args = parse_tool_arguments(blob)
-            if isinstance(args, dict) and args:
+            if isinstance(args, dict) and (
+                args or name in _ALLOW_EMPTY_SYNTHETIC_JSON_ARGS
+            ):
                 got = _one(name, args)
                 if got:
                     return got
@@ -440,10 +711,16 @@ def synthetic_tool_calls_from_text(
             candidates.append(t)
     for cand in candidates:
         got = _try_line(cand)
-        if got:
+        if got and _allow_high_risk_synthetic_tool(s, got):
             return got
+    # Embedded JSON tool objects: only if the ``{`` is not buried after a long
+    # same-line prose prefix (stops chit-chat + hallucinated ``open_app`` JSON).
+    max_prefix = 96
     for i, ch in enumerate(s):
         if ch != "{":
+            continue
+        prefix = _same_line_prefix_before_brace(s, i).strip()
+        if len(prefix) > max_prefix:
             continue
         blob = _balanced_json_slice(s, i)
         if not blob or len(blob) < 12:
@@ -453,6 +730,6 @@ def synthetic_tool_calls_from_text(
         except json.JSONDecodeError:
             continue
         got = _from_parsed_tool_json(parsed)
-        if got:
+        if got and _allow_high_risk_synthetic_tool(s, got):
             return got
     return []

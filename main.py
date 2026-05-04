@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import threading
 import json
@@ -6,7 +7,9 @@ import sys
 import traceback
 from pathlib import Path
 
-import os
+# Windows: faster-whisper/ctranslate2 and NumPy/sounddevice may each link Intel
+# OpenMP — duplicate libiomp5 triggers OMP #15 and can abort. Set before native imports.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import sounddevice as sd
 from google import genai
@@ -210,14 +213,28 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "weather_report",
-        "description": "Gives the weather report to user",
+        "description": (
+            "Gets the current weather (temperature, sky, wind, humidity) for a city using "
+            "a live forecast API. If the user does not name a city, pass an empty string — "
+            "the app uses ``weather_cities`` (array) or ``weather_city`` from api_keys.json."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "city": {"type": "STRING", "description": "City name"}
+                "city": {
+                    "type": "STRING",
+                    "description": (
+                        "City and optional region/country, e.g. 'Seattle' or 'Paris, France'. "
+                        "Use '' if the user did not specify a place."
+                    ),
+                },
+                "time": {
+                    "type": "STRING",
+                    "description": "Ignored for now (current conditions only); may be 'today'.",
+                },
             },
-            "required": ["city"]
-        }
+            "required": [],
+        },
     },
     {
         "name": "send_message",

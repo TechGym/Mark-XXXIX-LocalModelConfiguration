@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Union
 
@@ -18,6 +19,7 @@ from mark_tts import speak_mark_tts
 from jarvis_tool_runner import (
     ollama_tools_from_gemini_declarations,
     parse_tool_arguments,
+    refine_web_search_args,
     run_jarvis_tool,
     synthetic_tool_calls_from_text,
 )
@@ -33,7 +35,11 @@ def _base_dir() -> Path:
 PROMPT_PATH = _base_dir() / "core" / "prompt.txt"
 
 
-def _tts_say(text: str) -> None:
+def _tts_say(
+    text: str,
+    *,
+    on_audio_start: Callable[[], None] | None = None,
+) -> None:
     if os.environ.get("MARK_DISABLE_TTS", "").strip().lower() in (
         "1",
         "true",
@@ -44,9 +50,10 @@ def _tts_say(text: str) -> None:
     if not (text or "").strip():
         return
     try:
-        speak_mark_tts(text)
+        speak_mark_tts(text, on_audio_start=on_audio_start)
     except Exception as e:
         print(f"[TTS] speak failed: {e}")
+        raise
 
 
 def _load_system_prompt() -> str:
@@ -101,8 +108,34 @@ class JarvisOllama:
         parts.append(sys_prompt)
         parts.append(
             "\n[LOCAL MODE]\n"
-            "You are running on a local Ollama model. Use tools whenever the user "
-            "asks for an action. After tools complete, reply briefly in natural language.\n"
+            "You are running on a local Ollama model with **no built-in web access**. "
+            "You only know facts from this session, memory, and **tool results**. Never "
+            "invent headlines, prices, sports scores, or \"breaking\" news — call "
+            "**web_search** once with a query that matches the user's topic (e.g. "
+            "\"top sports headlines today US\" for sports news, not a generic unrelated query) "
+            "and then summarize what the tool returned.\n"
+            "Never print fake tool lines like ``web_search(query=...)``, "
+            "``[web_search(query=...)]``, or ``weather_report(city: ...)`` as your final answer — "
+            "either emit native tool_calls or JSON the host can parse; after tools run, reply in "
+            "plain language. Do not add bracket wrappers or \"Summarize the results here\" "
+            "placeholders instead of calling the tool.\n"
+            "If the assistant message already includes **web_search** tool results in this "
+            "turn's history, summarize them; do not say you did not search or that nothing "
+            "was found when the tool output is non-empty.\n"
+            "**Weather:** If the user asks about weather, temperature, forecast, rain, "
+            "\"is it raining\", or \"today's weather\", you **must** call **weather_report** "
+            "immediately once before answering — **never** ask for permission, access, or "
+            "confirmation to use weather tools. If they named a place, pass it as ``city`` "
+            "(STT may garble \"Lehigh Acres\" as \"Lea Acres\"; pass the phrase you heard; "
+            "the host normalizes common typos). If they did not name a place, pass **no** "
+            "``city`` field or ``city: \"\"`` — the app has default locations in config; "
+            "**do not** ask for city, region, or zip unless the tool errors with no defaults. "
+            "Never reply that you lack access or cannot check; the tool fetches live data. "
+            "If the tool returns a forecast, summarize it (including rain vs dry from the report) "
+            "— do not ask for location again.\n"
+            "Use tools whenever the user asks for an action. After tools complete, reply "
+            "briefly in natural language (the user hears your reply as voice — do not repeat "
+            "every number already present verbatim in the tool result; one short summary is enough).\n"
             "If the user asks you to greet or pass a short message to someone they name "
             "(e.g. a family member), do so in character; they are not asking you to "
             "look up external contact records or private data."
@@ -122,9 +155,16 @@ class JarvisOllama:
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
     async def _speak_async(self, text: str) -> None:
-        self.ui.set_state("SPEAKING")
         try:
-            await asyncio.to_thread(_tts_say, text)
+            await asyncio.to_thread(
+                _tts_say,
+                text,
+                on_audio_start=lambda: self.ui.set_state("SPEAKING"),
+            )
+        except Exception as ex:
+            short = str(ex).strip()[:220]
+            self.ui.write_log(f"SYS: Speech synthesis failed — {short}")
+            traceback.print_exc()
         finally:
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
@@ -253,6 +293,8 @@ class JarvisOllama:
                     fn = tc.get("function") or {}
                     tname = fn.get("name") or ""
                     args = parse_tool_arguments(fn.get("arguments"))
+                    if tname == "web_search" and isinstance(args, dict):
+                        args = refine_web_search_args(user_text, args)
                     print(f"[JARVIS] 📞 {tname}")
                     out = await run_jarvis_tool(
                         tname,
@@ -261,6 +303,7 @@ class JarvisOllama:
                         speak=self.speak,
                         speak_error=self.speak_error,
                         loop=loop,
+                        speak_from_tools=False,
                     )
                     tool_body = json.dumps(out, ensure_ascii=False)
                     tool_entry: dict = {

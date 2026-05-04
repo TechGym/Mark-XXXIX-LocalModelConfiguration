@@ -40,25 +40,82 @@ def _gemini_search(query: str) -> str:
 
 
 def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
+    """Fetch web snippets via DuckDuckGo.
+
+    The library default ``backend="auto"`` often returns nothing while
+    ``html`` / ``lite`` still work, so we try several backends then news.
+    """
     try:
         from ddgs import DDGS
     except ImportError:
         from duckduckgo_search import DDGS
 
-    results = []
+    seen: set[str] = set()
+    out: list[dict] = []
+
+    def _take_row(r: dict) -> None:
+        url = (r.get("href") or r.get("url") or "").strip()
+        key = url or ((r.get("title") or "").strip()[:120])
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append(
+            {
+                "title": r.get("title", ""),
+                "snippet": r.get("body", r.get("snippet", "")),
+                "url": url or r.get("href", ""),
+            }
+        )
+
     with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=max_results):
-            results.append({
-                "title":   r.get("title",  ""),
-                "snippet": r.get("body",   ""),
-                "url":     r.get("href",   ""),
-            })
-    return results
+        for backend in ("html", "lite", "auto"):
+            try:
+                batch = list(
+                    ddgs.text(
+                        query,
+                        max_results=max_results,
+                        backend=backend,
+                        safesearch="off",
+                    )
+                )
+            except Exception as exc:
+                print(f"[WebSearch] ⚠️ DDG text backend={backend!r}: {exc}")
+                batch = []
+            for r in batch:
+                _take_row(r)
+                if len(out) >= max_results:
+                    return out[:max_results]
+
+        if len(out) < max_results:
+            try:
+                for r in ddgs.news(
+                    query,
+                    max_results=max_results,
+                    safesearch="off",
+                    region="us-en",
+                ):
+                    _take_row(
+                        {
+                            "title": r.get("title", ""),
+                            "body": r.get("body", ""),
+                            "href": r.get("url", ""),
+                        }
+                    )
+                    if len(out) >= max_results:
+                        break
+            except Exception as exc:
+                print(f"[WebSearch] ⚠️ DDG news fallback: {exc}")
+
+    return out[:max_results]
 
 
 def _format_ddg(query: str, results: list[dict]) -> str:
     if not results:
-        return f"No results found for: {query}"
+        return (
+            f"No search results were returned for: {query}\n"
+            "DuckDuckGo may be rate-limiting or blocking automated requests; "
+            "wait a minute and retry, or check network and VPN, sir."
+        )
 
     lines = [f"Search results for: {query}\n"]
     for i, r in enumerate(results, 1):
@@ -69,14 +126,19 @@ def _format_ddg(query: str, results: list[dict]) -> str:
     return "\n".join(lines).strip()
 
 def _compare(items: list[str], aspect: str) -> str:
+    from mark_llm_settings import is_ollama_mode
+
     query = (
         f"Compare {', '.join(items)} in terms of {aspect}. "
         "Give specific facts and data."
     )
-    try:
-        return _gemini_search(query)
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ Gemini compare failed: {e} — falling back to DDG")
+    if is_ollama_mode():
+        print("[WebSearch] 🦙 Ollama mode — compare via DuckDuckGo only.")
+    else:
+        try:
+            return _gemini_search(query)
+        except Exception as e:
+            print(f"[WebSearch] ⚠️ Gemini compare failed: {e} — falling back to DDG")
 
     # DDG fallback: fetch results per item and merge
     all_results: dict[str, list] = {}
@@ -124,7 +186,19 @@ def web_search(
             print("[WebSearch] ✅ Compare done.")
             return result
 
-        print("[WebSearch] 🌐 Trying Gemini...")
+        from mark_llm_settings import is_ollama_mode
+
+        if is_ollama_mode():
+            print(
+                "[WebSearch] 🦙 Ollama chat mode — using DuckDuckGo (local model has no web; "
+                "this fetches live snippets for you to summarize)."
+            )
+            results = _ddg_search(query)
+            result = _format_ddg(query, results)
+            print(f"[WebSearch] ✅ DDG: {len(results)} result(s).")
+            return result
+
+        print("[WebSearch] 🌐 Trying Gemini (Google Search)…")
         try:
             result = _gemini_search(query)
             print("[WebSearch] ✅ Gemini OK.")

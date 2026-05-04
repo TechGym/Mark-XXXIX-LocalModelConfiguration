@@ -97,40 +97,6 @@ def get_ollama_vision_model() -> str:
     return v or "llava"
 
 
-def get_gemini_live_voice_name() -> str:
-    """
-    Prebuilt Gemini voice id for **Live** sessions and for **local Gemini TTS**
-    (when ``tts_backend`` is ``gemini``).
-
-    Override with ``MARK_GEMINI_VOICE`` / ``GEMINI_LIVE_VOICE``, or
-    ``gemini_live_voice`` / ``gemini_voice_name`` in ``config/api_keys.json``.
-    Default ``Charon``. See Gemini speech docs for the full list.
-    """
-    v = (
-        os.environ.get("MARK_GEMINI_VOICE", "").strip()
-        or os.environ.get("GEMINI_LIVE_VOICE", "").strip()
-        or (_load_config().get("gemini_live_voice") or "").strip()
-        or (_load_config().get("gemini_voice_name") or "").strip()
-    )
-    return v or "Charon"
-
-
-def get_local_tts_voice_substring() -> str | None:
-    """
-    Substring matched against Windows SAPI voice **display names** for ``pyttsx3``.
-
-    First voice whose ``name`` contains this substring (case-insensitive) is used.
-    Set ``MARK_TTS_VOICE``, or ``tts_voice_substring`` / ``local_tts_voice`` in
-    ``config/api_keys.json``. Example substrings: ``David``, ``Zira``, ``Mark``.
-    """
-    v = (
-        os.environ.get("MARK_TTS_VOICE", "").strip()
-        or (_load_config().get("tts_voice_substring") or "").strip()
-        or (_load_config().get("local_tts_voice") or "").strip()
-    )
-    return v or None
-
-
 # Prebuilt Gemini TTS / Live voice names (see Gemini speech generation docs).
 GEMINI_TTS_VOICE_NAMES: tuple[str, ...] = (
     "Achernar",
@@ -166,6 +132,50 @@ GEMINI_TTS_VOICE_NAMES: tuple[str, ...] = (
 )
 
 
+def get_gemini_live_voice_name() -> str:
+    """
+    Prebuilt Gemini voice id for **Live** sessions and for **local Gemini TTS**
+    (when ``tts_backend`` is ``gemini``).
+
+    Override with ``MARK_GEMINI_VOICE`` / ``GEMINI_LIVE_VOICE``, or
+    ``gemini_live_voice`` / ``gemini_voice_name`` in ``config/api_keys.json``.
+    Default ``Charon``. Unknown names fall back to **Kore** so TTS API requests stay valid.
+
+    See Gemini speech docs for the full list (same ids as ``GEMINI_TTS_VOICE_NAMES``).
+    """
+    raw = (
+        os.environ.get("MARK_GEMINI_VOICE", "").strip()
+        or os.environ.get("GEMINI_LIVE_VOICE", "").strip()
+        or (_load_config().get("gemini_live_voice") or "").strip()
+        or (_load_config().get("gemini_voice_name") or "").strip()
+    )
+    v = (raw or "Charon").strip() or "Charon"
+    by_lower = {n.lower(): n for n in GEMINI_TTS_VOICE_NAMES}
+    if v.lower() in by_lower:
+        return by_lower[v.lower()]
+    print(
+        f"[TTS] gemini_live_voice {v!r} is not a known prebuilt id — using 'Kore'. "
+        "Pick a name from the VOICE OUTPUT (LOCAL) Gemini list in the UI."
+    )
+    return "Kore"
+
+
+def get_local_tts_voice_substring() -> str | None:
+    """
+    Substring matched against Windows SAPI voice **display names** for ``pyttsx3``.
+
+    First voice whose ``name`` contains this substring (case-insensitive) is used.
+    Set ``MARK_TTS_VOICE``, or ``tts_voice_substring`` / ``local_tts_voice`` in
+    ``config/api_keys.json``. Example substrings: ``David``, ``Zira``, ``Mark``.
+    """
+    v = (
+        os.environ.get("MARK_TTS_VOICE", "").strip()
+        or (_load_config().get("tts_voice_substring") or "").strip()
+        or (_load_config().get("local_tts_voice") or "").strip()
+    )
+    return v or None
+
+
 def list_gemini_tts_voice_names() -> list[str]:
     return list(GEMINI_TTS_VOICE_NAMES)
 
@@ -199,15 +209,100 @@ def get_gemini_tts_model() -> str:
     """
     Gemini TTS model id for ``generate_content`` (see Google speech docs).
 
-    Default ``gemini-3.1-flash-tts-preview`` — older ``gemini-2.5-flash-preview-tts`` /
-    ``gemini-2.5-flash-tts`` often share a **small free-tier quota**; 429s there fall
-    back to Windows SAPI unless you set ``gemini_tts_model`` / ``MARK_GEMINI_TTS_MODEL``.
+    Default ``gemini-2.5-flash-preview-tts`` — often shares quota with other **2.5 Flash**
+    usage on your project. To prefer **3.1** instead, set ``gemini_tts_model`` in
+    ``api_keys.json`` (or ``MARK_GEMINI_TTS_MODEL``) to ``gemini-3.1-flash-tts-preview``.
+    ``mark_tts`` retries other known TTS models on 429 before falling back to SAPI.
     """
     v = (
         os.environ.get("MARK_GEMINI_TTS_MODEL", "").strip()
         or (_load_config().get("gemini_tts_model") or "").strip()
     )
-    return v or "gemini-3.1-flash-tts-preview"
+    return v or "gemini-2.5-flash-preview-tts"
+
+
+def get_weather_default_cities() -> list[str]:
+    """
+    Default place names for ``weather_report`` when the model omits or placeholders ``city``.
+
+    Priority:
+
+    1. ``weather_cities`` in ``api_keys.json`` — JSON array of strings, e.g.
+       ``["Lehigh, FL", "Miami, FL"]``.
+    2. ``MARK_WEATHER_CITY`` — semicolon-separated list, e.g. ``Lehigh, FL; Miami, FL``.
+    3. ``weather_city`` or ``default_city`` in ``api_keys.json`` (single string).
+    """
+    data = _load_config()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(s: str) -> None:
+        t = s.strip()
+        if not t or len(t) > 120:
+            return
+        k = t.lower()
+        if k in seen:
+            return
+        seen.add(k)
+        out.append(t)
+
+    raw_list = data.get("weather_cities")
+    if isinstance(raw_list, list):
+        for x in raw_list:
+            if isinstance(x, str):
+                _add(x)
+        if out:
+            return out
+
+    env = os.environ.get("MARK_WEATHER_CITY", "").strip()
+    if env:
+        for part in env.split(";"):
+            _add(part)
+        if out:
+            return out
+
+    one = (data.get("weather_city") or "").strip() or (data.get("default_city") or "").strip()
+    if one:
+        _add(one)
+    return out
+
+
+def get_weather_default_city() -> str:
+    """First default location, or empty string (backward compatible)."""
+    cities = get_weather_default_cities()
+    return cities[0] if cities else ""
+
+
+def get_weather_open_browser() -> bool:
+    """If True, also open a Google search tab after a successful forecast (default False)."""
+    ev = os.environ.get("MARK_WEATHER_OPEN_BROWSER", "").strip().lower()
+    if ev in ("1", "true", "yes", "on"):
+        return True
+    if ev in ("0", "false", "no", "off"):
+        return False
+    v = (_load_config().get("weather_open_browser") or "")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "on")
+
+
+def get_weather_use_imperial_units() -> bool:
+    """Fahrenheit + mph when True (default on Windows in config)."""
+    ev = os.environ.get("MARK_WEATHER_IMPERIAL", "").strip().lower()
+    if ev in ("1", "true", "yes", "imperial", "f"):
+        return True
+    if ev in ("0", "false", "no", "metric", "c"):
+        return False
+    u = (_load_config().get("weather_units") or "").strip().lower()
+    if u in ("metric", "celsius", "c"):
+        return False
+    if u in ("imperial", "fahrenheit", "f"):
+        return True
+    osname = (_load_config().get("os_system") or "").strip().lower()
+    return osname == "windows"
 
 
 def ollama_model_env_locked() -> bool:

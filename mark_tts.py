@@ -11,8 +11,10 @@ Text-to-speech for **local Ollama** reply paths.
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 import io
 import os
+import tempfile
 import platform
 import sys
 import threading
@@ -22,6 +24,16 @@ _tls = threading.local()
 # pyttsx3 / SAPI are not safe across thread-pool threads; serialize all TTS.
 _tts_lock = threading.Lock()
 _tts_backend_hint_printed = False
+
+
+def _invoke_on_audio_start(cb: Callable[[], None] | None) -> None:
+    """Notify HUD / callers right before audio leaves the speaker (best-effort)."""
+    if not cb:
+        return
+    try:
+        cb()
+    except Exception as ex:
+        print(f"[TTS] on_audio_start callback failed: {ex}")
 
 
 def _ensure_win32_com_apartment() -> None:
@@ -105,16 +117,53 @@ def configure_pyttsx3(engine) -> None:
         print(f"[TTS] Voice config skipped: {ex}")
 
 
-def _speak_pyttsx3_no_lock(text: str) -> None:
-    """``pyttsx3`` path; caller must hold ``_tts_lock``."""
+def _speak_pyttsx3_no_lock(
+    text: str,
+    *,
+    on_audio_start: Callable[[], None] | None = None,
+) -> None:
+    """
+    ``pyttsx3`` / SAPI path; caller must hold ``_tts_lock``.
+
+    When possible, render to a temp WAV and play via **sounddevice** — same output
+    path as Gemini TTS — so Bluetooth / app default routing matches neural speech.
+    If ``save_to_file`` fails, fall back to ``say`` + ``runAndWait()`` (Windows
+    default SAPI device only).
+    """
     utter = (text or "").strip()
     if not utter:
         return
     _ensure_win32_com_apartment()
-    engine = create_pyttsx3_engine()
-    configure_pyttsx3(engine)
-    engine.say(utter)
-    engine.runAndWait()
+
+    tmp_path: str | None = None
+    try:
+        eng = create_pyttsx3_engine()
+        configure_pyttsx3(eng)
+        fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        eng.save_to_file(utter, tmp_path)
+        eng.runAndWait()
+        with open(tmp_path, "rb") as wf:
+            data = wf.read()
+        if data.startswith(b"RIFF") and len(data) > 100:
+            _invoke_on_audio_start(on_audio_start)
+            _play_wav_bytes_riff(data)
+            return
+        print("[TTS] SAPI WAV export was empty or not RIFF — using live SAPI output.")
+    except Exception as ex:
+        print(f"[TTS] SAPI→PortAudio bridge failed ({ex}); using live SAPI output.")
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    eng2 = create_pyttsx3_engine()
+    configure_pyttsx3(eng2)
+    eng2.say(utter)
+    _invoke_on_audio_start(on_audio_start)
+    eng2.runAndWait()
 
 
 def _play_pcm_int16_mono(pcm: bytes, sample_rate: int) -> None:
@@ -216,7 +265,24 @@ def _gemini_extract_audio(response) -> tuple[bytes, str] | None:
     return None
 
 
-_ALT_TTS_MODEL = "gemini-3.1-flash-tts-preview"
+# After the configured primary, try these on 429 (deduped, order preserved).
+_GEMINI_TTS_FALLBACK_MODELS: tuple[str, ...] = (
+    "gemini-2.5-flash-preview-tts",
+    "gemini-3.1-flash-tts-preview",
+)
+
+
+def _gemini_tts_models_to_try(primary: str) -> list[str]:
+    """Primary first, then other known TTS model ids (no duplicates)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in (primary, *_GEMINI_TTS_FALLBACK_MODELS):
+        mid = (m or "").strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+    return out
 
 
 def _is_gemini_tts_quota_error(exc: BaseException) -> bool:
@@ -229,7 +295,11 @@ def _is_gemini_tts_quota_error(exc: BaseException) -> bool:
     )
 
 
-def _try_gemini_tts(text: str) -> bool:
+def _try_gemini_tts(
+    text: str,
+    *,
+    on_audio_start: Callable[[], None] | None = None,
+) -> bool:
     """Synthesize with Gemini TTS API and play. Returns False to fall back to pyttsx3."""
     from mark_llm_settings import (
         get_gemini_api_key,
@@ -265,9 +335,7 @@ def _try_gemini_tts(text: str) -> bool:
     voice = get_gemini_live_voice_name()
     client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
 
-    models_to_try = [primary]
-    if primary.strip() != _ALT_TTS_MODEL:
-        models_to_try.append(_ALT_TTS_MODEL)
+    models_to_try = _gemini_tts_models_to_try(primary)
 
     response = None
     model_used = primary
@@ -291,9 +359,10 @@ def _try_gemini_tts(text: str) -> bool:
             break
         except Exception as ex:
             if _is_gemini_tts_quota_error(ex) and i + 1 < len(models_to_try):
+                nxt = models_to_try[i + 1]
                 print(
                     f"[TTS] Gemini TTS model {model!r} is rate-limited or over quota; "
-                    f"retrying {_ALT_TTS_MODEL!r}…"
+                    f"retrying {nxt!r}…"
                 )
                 continue
             if _is_gemini_tts_quota_error(ex):
@@ -325,6 +394,7 @@ def _try_gemini_tts(text: str) -> bool:
         return False
     data, mime = got
     try:
+        _invoke_on_audio_start(on_audio_start)
         if "wav" in mime or data[:4] == b"RIFF":
             _play_wav_bytes_riff(data)
         else:
@@ -342,18 +412,30 @@ def _try_gemini_tts(text: str) -> bool:
     return True
 
 
-def speak_local_tts(text: str) -> None:
+def speak_local_tts(
+    text: str,
+    *,
+    on_audio_start: Callable[[], None] | None = None,
+) -> None:
     """``pyttsx3`` only (Windows SAPI). Serialized with other TTS paths."""
     if not (text or "").strip():
         return
     with _tts_lock:
-        _speak_pyttsx3_no_lock(text)
+        _speak_pyttsx3_no_lock(text, on_audio_start=on_audio_start)
 
 
-def speak_mark_tts(text: str) -> None:
+def speak_mark_tts(
+    text: str,
+    *,
+    on_audio_start: Callable[[], None] | None = None,
+) -> None:
     """
     Local Jarvis speech: **Gemini TTS** when ``tts_backend`` is ``gemini`` and a
     ``gemini_api_key`` is set; otherwise **pyttsx3**.
+
+    ``on_audio_start`` runs on the TTS thread **immediately before** PortAudio /
+    SAPI begins playback — use it to sync the SPEAKING HUD with audible output
+    (Gemini otherwise spends seconds in HTTP synthesis first).
     """
     if not (text or "").strip():
         return
@@ -373,11 +455,17 @@ def speak_mark_tts(text: str) -> None:
                 "\"tts_backend\": \"gemini\" in config/api_keys.json."
             )
             _tts_backend_hint_printed = True
-        if _try_gemini_tts(text):
+        if _try_gemini_tts(text, on_audio_start=on_audio_start):
             return
         if get_local_tts_backend() == "gemini":
             print(
                 "[TTS] Gemini TTS failed or returned no usable audio — "
                 "falling back to Windows SAPI (e.g. Zira). See [TTS] lines above."
             )
-        _speak_pyttsx3_no_lock(text)
+        print("[TTS] Invoking Windows SAPI (pyttsx3) fallback now…")
+        try:
+            _speak_pyttsx3_no_lock(text, on_audio_start=on_audio_start)
+            print("[TTS] Windows SAPI fallback completed.")
+        except Exception as ex:
+            print(f"[TTS] Windows SAPI fallback failed: {ex}")
+            raise

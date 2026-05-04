@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import os
+
+# Before NumPy / faster-whisper: avoid OMP duplicate-runtime abort on Windows (see main.py).
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 from typing import Optional
 
 import numpy as np
