@@ -34,6 +34,68 @@ SpeakFn = Callable[[str], None]
 SpeakErrFn = Callable[[str, str], None]
 
 
+def user_text_implies_external_messaging(user_text: str | None) -> bool:
+    """
+    True when the user clearly asked to use WhatsApp/SMS/etc., not only to speak
+    a greeting aloud.
+    """
+    if not user_text:
+        return False
+    t = user_text.strip().lower()
+    if not t:
+        return False
+    if re.search(
+        r"(?i)\b("
+        r"whatsapp|telegram|signal|slack|discord|imessage|sms|fb\s+messenger|facebook\s+messenger"
+        r")\b",
+        t,
+    ):
+        return True
+    if re.search(r"(?i)\bon\s+(?:whatsapp|telegram|signal|slack|discord)\b", t):
+        return True
+    if re.search(
+        r"(?i)\b(send|fire)\s+(?:him|her|them\s+)?(?:a\s+)?(?:text|message|dm)\b", t
+    ):
+        return True
+    if re.search(r"(?i)\bsend\s+(?:him|her|them\s+)?(?:a\s+)?(?:text\s+)?message\b", t):
+        return True
+    if re.search(r"(?i)\bsend\s+(?:a\s+)?text\s+to\b", t):
+        return True
+    if re.search(r"(?i)\bmessage\s+(?:him|her|them)\s+on\b", t):
+        return True
+    if re.search(r"(?i)\bdm\b", t):
+        return True
+    if re.search(r"(?i)\b(text|ping)\s+(?:him|her|them)\s+on\b", t):
+        return True
+    return False
+
+
+def user_text_is_in_character_greeting_only(user_text: str | None) -> bool:
+    """
+    Phrases like \"say hi to my grandson Cayden\" are meant as spoken roleplay,
+    not desktop automation to WhatsApp.
+    """
+    if not user_text:
+        return False
+    u = user_text.strip()
+    if len(u) > 400:
+        return False
+    tl = u.lower()
+    if user_text_implies_external_messaging(u):
+        return False
+    patterns = (
+        r"(?i)\bcan\s+you\s+say\s+(?:hi|hello|hey)\s+to\b",
+        r"(?i)\bplease\s+say\s+(?:hi|hello|hey)\s+to\b",
+        r"(?i)\bsay\s+(?:hi|hello|hey)\s+to\b",
+        r"(?i)\bgive\s+(?:him|her|them\s+)?(?:a\s+)?(?:wave\s+and\s+)?(?:hi|hello|hey)\s+to\b",
+        r"(?i)\bpass\s+(?:along\s+)?(?:a\s+)?(?:hello|hi|hey)\s+to\b",
+        r"(?i)\btell\s+\w[\w'-]*\s+(?:hi|hello|hey)\b",
+        r"(?i)\btell\s+\w[\w'-]*\s+that\s+i\s+said\s+hi\b",
+        r"(?i)\btell\s+\w[\w'-]*\s+i\s+said\s+hi\b",
+    )
+    return any(re.search(p, tl) for p in patterns)
+
+
 async def run_jarvis_tool(
     name: str,
     args: dict,
@@ -43,6 +105,7 @@ async def run_jarvis_tool(
     speak_error: SpeakErrFn,
     loop: asyncio.AbstractEventLoop,
     speak_from_tools: bool = True,
+    user_query: str | None = None,
 ) -> dict[str, Any]:
     """
     Execute one JARVIS tool by name.
@@ -51,6 +114,9 @@ async def run_jarvis_tool(
 
     ``speak_from_tools``: when False, tools that would TTS (e.g. ``weather_report``) stay silent
     so the host can speak only the model follow-up (avoids double audio on local Ollama).
+
+    ``user_query``: original user text for this turn (used to block mistaken ``send_message``
+    when they only asked for an in-character greeting).
     """
     print(f"[JARVIS] 🔧 {name}  {args}")
     ui.set_state("THINKING")
@@ -98,13 +164,27 @@ async def run_jarvis_tool(
             result = r or "Done."
 
         elif name == "send_message":
-            r = await loop.run_in_executor(
-                None,
-                lambda: send_message(
-                    parameters=args, response=None, player=ui, session_memory=None
-                ),
-            )
-            result = r or f"Message sent to {args.get('receiver')}."
+            uq = (user_query or "").strip() if user_query else ""
+            if uq and user_text_is_in_character_greeting_only(uq):
+                result = (
+                    "SKIPPED — Host policy: this looked like a spoken/in-character greeting "
+                    "(e.g. \"say hi to Cayden\"), not a request to open WhatsApp or send a real "
+                    "message. Do **not** claim a message was sent. Reply only with the greeting "
+                    "you would say aloud to that person."
+                )
+                if hasattr(ui, "write_log"):
+                    ui.write_log(
+                        "SYS: send_message skipped — greeting-only (use voice, not WhatsApp)."
+                    )
+                print("[JARVIS] send_message skipped (in-character greeting only).")
+            else:
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: send_message(
+                        parameters=args, response=None, player=ui, session_memory=None
+                    ),
+                )
+                result = r or f"Message sent to {args.get('receiver')}."
 
         elif name == "reminder":
             r = await loop.run_in_executor(

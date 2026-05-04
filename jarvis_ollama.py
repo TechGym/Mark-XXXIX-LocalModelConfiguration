@@ -102,6 +102,11 @@ def _ollama_tool_message_body(tool_name: str, payload: dict[str, Any]) -> str:
             "to look up weather again unless this block says there was an error.\n\n---\n\n"
             + raw_s
         )
+    if tool_name == "send_message" and isinstance(raw_s, str) and raw_s.startswith("SKIPPED"):
+        return (
+            "SEND_MESSAGE (host did **not** open messaging apps):\n\n"
+            + raw_s
+        )
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -286,9 +291,11 @@ class JarvisOllama:
             "Use tools whenever the user asks for an action. After tools complete, reply "
             "briefly in natural language (the user hears your reply as voice — do not repeat "
             "every number already present verbatim in the tool result; one short summary is enough).\n"
-            "If the user asks you to greet or pass a short message to someone they name "
-            "(e.g. a family member), do so in character; they are not asking you to "
-            "look up external contact records or private data."
+            "If the user asks you to greet someone by name (e.g. \"say hi to my grandson "
+            "Cayden\"), speak that greeting **in character** through your voice only. "
+            "Do **not** call **send_message** unless they explicitly ask to **send**, "
+            "**text**, **DM**, or **message on WhatsApp/Telegram/etc.** — short social "
+            "greetings are **not** desktop messaging tasks."
         )
         return "\n".join(parts)
 
@@ -473,6 +480,7 @@ class JarvisOllama:
                         speak_error=self.speak_error,
                         loop=loop,
                         speak_from_tools=False,
+                        user_query=user_text,
                     )
                     tool_body = _ollama_tool_message_body(tname, out)
                     tool_entry: dict = {

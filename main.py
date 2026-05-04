@@ -238,7 +238,13 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "send_message",
-        "description": "Sends a text message via WhatsApp, Telegram, or other messaging platform.",
+        "description": (
+            "Sends a real text through WhatsApp, Telegram, or similar (desktop automation). "
+            "Use **only** when the user clearly asks to **send**, **text**, **DM**, or "
+            "**message on [platform]** to someone. Do **not** use for vague social phrases "
+            "like \"say hi to my grandson\" or \"tell Mom hello\" — those are spoken "
+            "in-character greetings, not messaging app actions."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -687,7 +693,9 @@ class JarvisLive:
             ),
         )
 
-    async def _execute_tool(self, fc) -> types.FunctionResponse:
+    async def _execute_tool(
+        self, fc, *, user_query: str | None = None
+    ) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
         out = await run_jarvis_tool(
@@ -697,6 +705,7 @@ class JarvisLive:
             speak=self.speak,
             speak_error=self.speak_error,
             loop=asyncio.get_running_loop(),
+            user_query=user_query,
         )
         payload: dict = {"result": out.get("result", "Done.")}
         if out.get("silent"):
@@ -779,9 +788,12 @@ class JarvisLive:
 
                     if response.tool_call:
                         fn_responses = []
+                        partial_user = " ".join(in_buf).strip()
                         for fc in response.tool_call.function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
+                            fr = await self._execute_tool(
+                                fc, user_query=partial_user or None
+                            )
                             fn_responses.append(fr)
                         await self.session.send_tool_response(
                             function_responses=fn_responses
