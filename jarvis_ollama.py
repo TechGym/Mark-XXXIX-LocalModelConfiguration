@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import traceback
 from collections.abc import Callable
@@ -70,6 +71,136 @@ def _load_system_prompt() -> str:
 QueueItem = Union[str, tuple[str, bytes, int]]
 
 
+def _ollama_tool_message_body(tool_name: str, payload: dict[str, Any]) -> str:
+    """
+    Ollama small models often ignore ``{\"result\": ...}`` JSON. Use explicit prose
+    so the model treats tool output as real retrieved data to summarize.
+    """
+    raw = payload.get("result")
+    if isinstance(raw, (dict, list)):
+        raw_s = json.dumps(raw, ensure_ascii=False)
+    elif raw is None:
+        raw_s = ""
+    else:
+        raw_s = str(raw)
+    max_len = 12_000
+    if len(raw_s) > max_len:
+        raw_s = raw_s[: max_len - 3] + "..."
+    if tool_name == "web_search":
+        return (
+            "WEB SEARCH SNIPPETS (just fetched by the host; these are real page titles "
+            "and excerpts, not your prior knowledge). If you see numbered headlines below, "
+            "that **is** the retrieved material — summarize it for the user. Do **not** "
+            "apologize for being unable to fetch news, say you lack real-time access, or ask "
+            "them to open a browser, unless this block is empty or explicitly says no results.\n\n"
+            "---\n\n"
+            + raw_s
+        )
+    if tool_name == "weather_report":
+        return (
+            "WEATHER TOOL OUTPUT (already fetched). Give a brief spoken summary; do not ask "
+            "to look up weather again unless this block says there was an error.\n\n---\n\n"
+            + raw_s
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _ollama_tool_names(tools: list[dict] | None) -> set[str]:
+    names: set[str] = set()
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") or {}
+        n = fn.get("name") or ""
+        if isinstance(n, str) and n.strip():
+            names.add(n.strip())
+    return names
+
+
+def _user_means_read_browser_page(user_text: str) -> bool:
+    """
+    Short follow-ups like \"read?\" / \"read the page\" after ``go_to`` should use
+    ``browser_control(get_text)``, not ``screen_process`` / vision.
+    """
+    t = (user_text or "").strip()
+    if not t or len(t) > 160:
+        return False
+    tl = t.lower()
+    if re.search(r"(?i)\bwhat'?s?\s+on\s+(?:the\s+)?(?:screen|monitor)\b", tl):
+        return False
+    vision_cues = (
+        "camera",
+        "webcam",
+        "screenshot",
+        "vision mode",
+        "what do you see",
+        "what can you see",
+        "looking at my",
+        "on my monitor",
+        "on the monitor",
+        "this image",
+        "this picture",
+    )
+    if any(c in tl for c in vision_cues):
+        return False
+    if re.search(r"(?i)\bread\s+(?:aloud|out\s+loud)\b", tl):
+        return False
+    if re.search(
+        r"(?i)\bread\s+(?:the\s+)?(?:page|tab|site|browser|window)\b", tl
+    ):
+        return True
+    if re.search(r"(?i)\bcan\s+you\s+read\b", tl) and not re.search(
+        r"(?i)\b(book|pdf|file|document|email|minds?|thoughts?)\b", tl
+    ):
+        return True
+    if re.fullmatch(r"(?i)read\s*\??", t):
+        return True
+    if re.fullmatch(r"(?i)please\s+read\s*\??", t):
+        return True
+    if re.search(r"(?i)\bread\s+(?:it|that)\b", tl):
+        if "out loud" in tl or "aloud" in tl:
+            return False
+        return True
+    return False
+
+
+def _coerce_screen_process_to_browser_read(
+    user_text: str,
+    tool_calls: list[dict],
+    *,
+    valid_names: set[str],
+) -> list[dict]:
+    if not tool_calls:
+        return tool_calls
+    if "browser_control" not in valid_names or "screen_process" not in valid_names:
+        return tool_calls
+    if not _user_means_read_browser_page(user_text):
+        return tool_calls
+    out: list[dict] = []
+    changed = False
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        if name == "screen_process":
+            changed = True
+            row = dict(tc)
+            row["function"] = {
+                "name": "browser_control",
+                "arguments": {"action": "get_text"},
+            }
+            out.append(row)
+        else:
+            out.append(tc)
+    if changed:
+        print(
+            "[JARVIS] read-page intent: using browser_control(get_text) "
+            "instead of screen_process."
+        )
+    return out
+
+
 class JarvisOllama:
     """
     Ollama-powered assistant loop (Aletheon-style HTTP to ``/api/chat``).
@@ -114,6 +245,25 @@ class JarvisOllama:
             "**web_search** once with a query that matches the user's topic (e.g. "
             "\"top sports headlines today US\" for sports news, not a generic unrelated query) "
             "and then summarize what the tool returned.\n"
+            "**News / current events:** If they ask what's in the news, headlines, "
+            "\"what's going on today\", or similar **without** naming a narrow topic, still "
+            "call **web_search** once with a sensible broad query (e.g. "
+            "\"top world news today\" or \"US news headlines today\"). Do **not** refuse or "
+            "ask them to pick a country first unless they already gave a clear geographic scope.\n"
+            "**Opening / reading a website:** If they ask to **open** a URL, **load** a page, "
+            "or **read** a specific site in a browser (not just search snippets), use "
+            "**browser_control**: ``action: go_to`` with a full **https://…** ``url``, then "
+            "``get_text`` to read visible page text. Do not say you cannot open websites or "
+            "access pages directly — the host can control a browser. Use **web_search** for "
+            "quick headline-style snippets; use **browser_control** when they want the page "
+            "opened or read like a user would.\n"
+            "**Read page vs vision:** Short phrases like **read the page**, **read the tab**, "
+            "**read it**, or **can you read (the page)?** mean **browser_control** with "
+            "``action: get_text`` on the current tab — **not** **screen_process** / vision. "
+            "Use **screen_process** only when they ask what is on their **screen**, "
+            "**monitor**, **camera**, or for a **screenshot** / image description.\n"
+            "Never refuse \"read the page\" for policy reasons when **browser_control** exists; "
+            "call ``get_text`` and summarize the tool output.\n"
             "Never print fake tool lines like ``web_search(query=...)``, "
             "``[web_search(query=...)]``, or ``weather_report(city: ...)`` as your final answer — "
             "either emit native tool_calls or JSON the host can parse; after tools run, reply in "
@@ -264,15 +414,10 @@ class JarvisOllama:
             msg = data.get("message") or {}
             content = (msg.get("content") or "").strip()
             tool_calls = msg.get("tool_calls") or []
+            valid_names = _ollama_tool_names(self._ollama_tools)
             if not tool_calls and content:
-                valid = {
-                    (t.get("function") or {}).get("name") or ""
-                    for t in (self._ollama_tools or [])
-                    if isinstance(t, dict)
-                }
-                valid.discard("")
                 synthetic = synthetic_tool_calls_from_text(
-                    content, valid_names=valid
+                    content, valid_names=valid_names
                 )
                 if synthetic:
                     self.ui.write_log(
@@ -281,6 +426,30 @@ class JarvisOllama:
                     )
                     tool_calls = synthetic
                     content = ""
+
+            if (
+                len(messages) == 2
+                and not tool_calls
+                and _user_means_read_browser_page(user_text)
+                and "browser_control" in valid_names
+            ):
+                tool_calls = [
+                    {
+                        "function": {
+                            "name": "browser_control",
+                            "arguments": {"action": "get_text"},
+                        }
+                    }
+                ]
+                content = ""
+                self.ui.write_log(
+                    "SYS: Read-page intent — invoking browser_control(get_text)."
+                )
+
+            if tool_calls:
+                tool_calls = _coerce_screen_process_to_browser_read(
+                    user_text, tool_calls, valid_names=valid_names
+                )
 
             assistant_msg: dict = {"role": "assistant", "content": content}
             if tool_calls:
@@ -305,7 +474,7 @@ class JarvisOllama:
                         loop=loop,
                         speak_from_tools=False,
                     )
-                    tool_body = json.dumps(out, ensure_ascii=False)
+                    tool_body = _ollama_tool_message_body(tname, out)
                     tool_entry: dict = {
                         "role": "tool",
                         "content": tool_body,

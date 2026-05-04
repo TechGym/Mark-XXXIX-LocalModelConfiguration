@@ -340,10 +340,32 @@ _STRICT_MULTILINE_SYNTHETIC = frozenset(
 # OpenAI-style JSON tools with ``"arguments": {}`` — empty dict is falsy but valid here.
 _ALLOW_EMPTY_SYNTHETIC_JSON_ARGS = frozenset({"weather_report"})
 
+# Leading "Yeah, …" / "Yes, …" from follow-up turns (bad as a literal search query).
+_AFFIRMATIVE_LEAD_IN = re.compile(
+    r"(?i)^\s*(?:yeah|yep|yes|sure|ok|okay|right|absolutely|correct|fine)\s*[,!.:]\s*"
+)
+
+
+def scrub_affirmative_lead(text: str) -> str:
+    """Strip one or more leading affirmative fillers (``Yeah, `` …) from a line."""
+    t = (text or "").strip()
+    guard = 0
+    while t and guard < 6:
+        guard += 1
+        nxt = _AFFIRMATIVE_LEAD_IN.sub("", t, count=1).strip()
+        if nxt == t:
+            break
+        t = nxt
+    return t
+
+
 # Strip common PTT phrasing so we can compare the user's real topic to the model's query.
 _DISTILL_PREFIX_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Must consume at least one character — avoid a zero-width match on ``^`` alone.
     re.compile(r"(?i)^\s*(?:please\s+|can\s+you\s+|could\s+you\s+|will\s+you\s+)+"),
+    re.compile(
+        r"(?i)^\s*tell\s+me\s+(?:what\s+you\s+think\s+(?:about|of)\s+|about)\s+"
+    ),
     # "Use web search for" / "Use the web search for" (not only "Use the web …").
     re.compile(
         r"(?i)^\s*(?:use\s+(?:the\s+)?)?web\s*search\s*,?\s*(for|to|about)\s+"
@@ -403,7 +425,7 @@ _BROAD_NEWS_HINTS = (
 
 def distill_user_search_intent(user_text: str) -> str:
     """Remove leading 'web search for …' style boilerplate from the user line."""
-    s = (user_text or "").strip()
+    s = scrub_affirmative_lead(user_text or "")
     if not s:
         return ""
     changed = True
@@ -452,6 +474,55 @@ def refine_web_search_query(user_text: str, model_query: str) -> str:
     return mq
 
 
+def compact_vague_news_web_query(query: str, context: str) -> str:
+    """
+    Turn spoken news questions into tight DDG keywords (full sentences often return nothing).
+    """
+    q = (query or "").strip()
+    if not q:
+        return q
+    combined = f"{q} {context or ''}".lower()
+    if re.search(
+        r"(?i)\b(weather|temperature|forecast|rain|snow|humidity|mph|degrees)\b",
+        combined,
+    ):
+        return q
+    newsish = bool(
+        re.search(
+            r"(?i)\b(news|headlines|breaking|international|worldwide|world|globe|"
+            r"going\s+on|happening|today|current\s+events)\b",
+            combined,
+        )
+    )
+    vague_phrase = bool(
+        re.search(
+            r"(?i)\b(what'?s?\s+going\s+on|what\s+is\s+happening|what\s+happened|"
+            r"what'?s?\s+the\s+news|what'?s?\s+new|what\s+are\s+the\s+headlines|"
+            r"anything\s+important\s+in\s+the\s+news|in\s+the\s+news\s+today)\b",
+            q,
+        )
+    )
+    long_what = bool(
+        len(q) > 44
+        and re.match(r"(?i)^(what|when|where|why|how|who|tell\s+me|give\s+me)\b", q)
+        and newsish
+    )
+    if not (vague_phrase or long_what):
+        return q
+    if "iran" in combined:
+        return "Iran international news headlines today"
+    if re.search(r"\b(us|u\.s\.|america|american|washington)\b", combined):
+        return "US news headlines today"
+    if re.search(
+        r"\b(world|global|international|globe|everywhere|planet|earth)\b",
+        combined,
+    ):
+        return "world news headlines today"
+    if newsish:
+        return "top world news headlines today"
+    return q
+
+
 def apply_site_operator_from_user_request(user_text: str, query: str) -> str:
     """Add site: when the user asked for a specific outlet."""
     u = user_text or ""
@@ -459,9 +530,11 @@ def apply_site_operator_from_user_request(user_text: str, query: str) -> str:
     q = (query or "").strip()
     if not q or "site:" in q.lower():
         return q
-    if "cnn.com" in ul or re.search(r"\bcnn\s*\.\s*com\b", u, re.I):
-        q_body = re.sub(r"(?i)^\s*cnn\.com\s+", "", q).strip()
-        return f"site:cnn.com {q_body}"[:280]
+    if "rt.com" in ul or re.search(r"\brt\.com\b", u, re.I) or re.search(
+        r"(?i)\brt\s+news\b", u
+    ):
+        q_body = re.sub(r"(?i)^\s*rt\.com\s+", "", q).strip()
+        return f"site:rt.com {q_body}"[:280]
     if "apnews.com" in ul or "apnews" in ul or re.search(r"\bap\s+news\b", u, re.I):
         q_body = re.sub(r"(?i)^\s*apnews\.com\s+", "", q).strip()
         return f"site:apnews.com {q_body}"[:280]
@@ -475,18 +548,20 @@ def refine_web_search_args(user_text: str, args: dict) -> dict:
     """Blend user intent + optional site: hint into web_search parameters."""
     if not isinstance(args, dict):
         return args
-    q0 = (args.get("query") or "").strip()
-    u = (user_text or "").strip()
-    if not u:
+    raw_q = (args.get("query") or "").strip()
+    u = scrub_affirmative_lead((user_text or "").strip())
+    ctx = u or raw_q
+    q = scrub_affirmative_lead(raw_q)
+    if u:
+        q = refine_web_search_query(u, q)
+    # Run *after* topic refinement so we do not replace a tight query with long distilled text.
+    q = compact_vague_news_web_query(q, ctx)
+    if u:
+        q = apply_site_operator_from_user_request(u, q)
+    if q == raw_q:
         return args
-    q1 = refine_web_search_query(u, q0)
-    q2 = apply_site_operator_from_user_request(u, q1)
-    if q2 == q0:
-        return args
-    print(f"[JARVIS] web_search query refined: {q0!r} -> {q2!r}")
-    out = dict(args)
-    out["query"] = q2
-    return out
+    print(f"[JARVIS] web_search query refined: {raw_q!r} -> {q!r}")
+    return {**args, "query": q}
 
 
 def _line_smells_like_chat_prose(line: str) -> bool:

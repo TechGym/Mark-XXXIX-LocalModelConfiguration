@@ -1,7 +1,10 @@
-#web_search.py
+# web_search.py
 import json
+import re
 import sys
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -37,6 +40,188 @@ def _gemini_search(query: str) -> str:
     if not text:
         raise ValueError("Gemini returned an empty response.")
     return text
+
+
+def _strip_html_snippet(s: str, *, limit: int = 400) -> str:
+    if not s:
+        return ""
+    t = re.sub(r"<[^>]+>", " ", s)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:limit]
+
+
+def _query_suggests_news_rss_fallback(query: str) -> bool:
+    """When DDG returns nothing, RSS feeds often still work (different host / rate limits)."""
+    ql = (query or "").lower()
+    needles = (
+        "world",
+        "headline",
+        "news",
+        "global",
+        "international",
+        "breaking",
+        "today",
+        "current events",
+    )
+    return any(n in ql for n in needles)
+
+
+def _rss_channel_items(
+    feed_url: str, *, max_items: int = 10, timeout: int = 20
+) -> list[dict]:
+    import xml.etree.ElementTree as ET
+
+    req = Request(
+        feed_url,
+        headers={
+            "User-Agent": (
+                "Mark-XXXIX/1.0 (news RSS fallback; "
+                "+https://github.com/denalidao/Mark-XXXIX)"
+            ),
+        },
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except (HTTPError, URLError, OSError, TimeoutError) as e:
+        print(f"[WebSearch] RSS fetch failed {feed_url!r}: {e}")
+        return []
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        print(f"[WebSearch] RSS parse error for {feed_url!r}: {e}")
+        return []
+    channel = root.find("channel")
+    if channel is None:
+        return []
+    out: list[dict] = []
+    for item in channel.findall("item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        if not title:
+            continue
+        out.append(
+            {
+                "title": title,
+                "snippet": _strip_html_snippet(desc),
+                "url": link or feed_url,
+            }
+        )
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _news_rss_fallback_results(query: str, max_results: int = 8) -> list[dict]:
+    if not _query_suggests_news_rss_fallback(query):
+        return []
+    for feed_url in (
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://www.rt.com/rss/",
+    ):
+        items = _rss_channel_items(feed_url, max_items=max_results)
+        if items:
+            print(f"[WebSearch] RSS headlines from {feed_url}")
+            return items
+    return []
+
+
+# Hostname in a user/model query: try ``site:``, bare host, then direct HTTP excerpt.
+# One or more ``label.`` segments, then a known TLD (``denalidao.com`` matches).
+_DOMAIN_IN_QUERY = re.compile(
+    r"(?i)\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:com|org|net|io|ai|dev|gov|co|app|xyz|tech|news|blog|finance|us|uk))\b"
+)
+
+
+def extract_primary_domain_from_query(query: str) -> str | None:
+    m = _DOMAIN_IN_QUERY.search(query or "")
+    return m.group(1).lower() if m else None
+
+
+def _collect_ddg_with_domain_variants(query: str, *, max_results: int = 8) -> list[dict]:
+    """Merge DDG rows for the raw query plus ``site:host`` and bare ``host`` when a domain appears."""
+    seen: set[str] = set()
+    out: list[dict] = []
+
+    def _add(rows: list[dict]) -> None:
+        for row in rows:
+            key = (row.get("url") or "").strip() or (row.get("title") or "").strip()[:160]
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+            if len(out) >= max_results:
+                return
+
+    _add(_ddg_search(query, max_results=max_results))
+    host = extract_primary_domain_from_query(query)
+    if host:
+        _add(_ddg_search(f"site:{host}", max_results=max_results))
+        if len(out) < max_results:
+            _add(_ddg_search(host, max_results=max_results))
+    return out[:max_results]
+
+
+def _fetch_homepage_snippet(hostname: str, *, timeout: int = 18, max_bytes: int = 400_000) -> list[dict]:
+    """
+    Last resort: GET ``https://{host}/`` (and ``www``) and build one pseudo search row
+    so the model can summarize a site DDG often misses.
+    """
+    host = (hostname or "").strip().lower().rstrip(".")
+    if not host or "." not in host:
+        return []
+    for url in (f"https://{host}/", f"https://www.{host}/"):
+        try:
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mark-XXXIX/1.0 (homepage excerpt for assistant; "
+                        "+https://github.com/denalidao/Mark-XXXIX)"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+                },
+            )
+            with urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raw = raw[:max_bytes]
+            html = raw.decode("utf-8", errors="replace")
+        except (HTTPError, URLError, OSError, TimeoutError, ValueError) as e:
+            print(f"[WebSearch] HTTP homepage fetch failed {url!r}: {e}")
+            continue
+        title = ""
+        t_m = re.search(r"(?is)<title[^>]*>([^<]{1,280})", html)
+        if t_m:
+            title = _strip_html_snippet(t_m.group(1))[:240]
+        snippet = ""
+        d_m = re.search(
+            r'(?is)<meta\s+[^>]*name\s*=\s*["\']description["\'][^>]*\s+content\s*=\s*["\']([^"\'<]{1,500})',
+            html,
+        ) or re.search(
+            r'(?is)<meta\s+[^>]*content\s*=\s*["\']([^"\'<]{1,500})[^>]*name\s*=\s*["\']description["\']',
+            html,
+        )
+        if d_m:
+            snippet = _strip_html_snippet(d_m.group(1))
+        if len(snippet) < 40:
+            p_m = re.search(r"(?is)<p[^>]*>([^<]{25,800})", html)
+            if p_m:
+                snippet = _strip_html_snippet(p_m.group(1))
+        if not title:
+            title = host
+        if not snippet:
+            snippet = "(No plain-text excerpt could be pulled from the homepage HTML.)"
+        return [
+            {
+                "title": f"{title} (homepage)",
+                "snippet": snippet[:900],
+                "url": url,
+            }
+        ]
+    return []
 
 
 def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
@@ -114,7 +299,11 @@ def _format_ddg(query: str, results: list[dict]) -> str:
         return (
             f"No search results were returned for: {query}\n"
             "DuckDuckGo may be rate-limiting or blocking automated requests; "
-            "wait a minute and retry, or check network and VPN, sir."
+            "wait a minute and retry, or check network and VPN, sir.\n\n"
+            "For the assistant: tell the user briefly that no headline snippets came back "
+            "this round (often rate limits or the query phrasing). Suggest they try again "
+            "in a minute. Do not invent articles or sources; do not claim their home internet "
+            "is broken unless they said so."
         )
 
     lines = [f"Search results for: {query}\n"]
@@ -193,9 +382,19 @@ def web_search(
                 "[WebSearch] 🦙 Ollama chat mode — using DuckDuckGo (local model has no web; "
                 "this fetches live snippets for you to summarize)."
             )
-            results = _ddg_search(query)
+            results = _collect_ddg_with_domain_variants(query, max_results=8)
+            if not results and _query_suggests_news_rss_fallback(query):
+                rss = _news_rss_fallback_results(query)
+                if rss:
+                    results = rss
+            host = extract_primary_domain_from_query(query)
+            if not results and host:
+                page_rows = _fetch_homepage_snippet(host)
+                if page_rows:
+                    print(f"[WebSearch] HTTP homepage excerpt for {host}")
+                    results = page_rows
             result = _format_ddg(query, results)
-            print(f"[WebSearch] ✅ DDG: {len(results)} result(s).")
+            print(f"[WebSearch] ✅ {len(results)} snippet(s) for Ollama.")
             return result
 
         print("[WebSearch] 🌐 Trying Gemini (Google Search)…")
@@ -205,9 +404,15 @@ def web_search(
             return result
         except Exception as e:
             print(f"[WebSearch] ⚠️ Gemini failed ({e}) — trying DDG...")
-            results = _ddg_search(query)
-            result  = _format_ddg(query, results)
-            print(f"[WebSearch] ✅ DDG: {len(results)} result(s).")
+            results = _collect_ddg_with_domain_variants(query, max_results=8)
+            host = extract_primary_domain_from_query(query)
+            if not results and host:
+                page_rows = _fetch_homepage_snippet(host)
+                if page_rows:
+                    print(f"[WebSearch] HTTP homepage excerpt for {host}")
+                    results = page_rows
+            result = _format_ddg(query, results)
+            print(f"[WebSearch] ✅ DDG (+domain variants): {len(results)} result(s).")
             return result
 
     except Exception as e:
