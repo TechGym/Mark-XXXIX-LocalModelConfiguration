@@ -79,9 +79,14 @@ send_message
   platform: string (required)
 
 reminder
-  date: string YYYY-MM-DD (required)
-  time: string HH:MM (required)
-  message: string (required)
+  action: schedule | list | cancel (optional, default schedule)
+  date: string YYYY-MM-DD (schedule)
+  time: string HH:MM 24h (schedule)
+  message: string (schedule)
+  recurrence: once | daily | weekly | weekdays (Windows for non-once)
+  job_name: string (optional stable id for recurring / cancel by short name)
+  task_name: string (cancel — full name from list)
+  open_app_name: string (optional Windows — start app after notify)
 
 desktop_control
   action: "wallpaper" | "organize" | "clean" | "list" | "task" (required)
@@ -145,10 +150,25 @@ Steps:
 
 send_message | receiver: John, message_text: "There is a meeting tomorrow", platform: WhatsApp
 
+Goal: "Email Michele through Proton Mail saying I love you"
+Steps:
+
+send_message | receiver: Michele, message_text: "I love you", platform: Proton Mail
+
 Goal: "Open the clock and set a reminder for 30 minutes later"
 Steps:
 
 reminder | date: [today], time: [now+30min], message: "Reminder"
+
+Goal: "Every weekday at 9am remind me to stand and open Notepad"
+Steps:
+
+reminder | action: schedule, date: [next weekday], time: 09:00, message: "Time to stand", recurrence: weekdays, job_name: standstretch, open_app_name: notepad
+
+Goal: "List my Jarvis scheduled tasks"
+Steps:
+
+reminder | action: list
 
 OUTPUT — return ONLY valid JSON, no markdown, no explanation, no code blocks:
 {

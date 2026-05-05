@@ -201,17 +201,39 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "web_search",
-        "description": "Searches the web for any information.",
+        "description": (
+            "Web research: **search** (DuckDuckGo / Gemini), **news** (headlines), **compare**, "
+            "or **fetch** (download one http(s) page as plain text for the assistant). "
+            "Use **fetch** when the user gives a specific URL to read; use **search** for open topics."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "query":  {"type": "STRING", "description": "Search query"},
-                "mode":   {"type": "STRING", "description": "search (default) or compare"},
-                "items":  {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Items to compare"},
-                "aspect": {"type": "STRING", "description": "price | specs | reviews"}
+                "query": {
+                    "type": "STRING",
+                    "description": "Search query (required for search/news/compare).",
+                },
+                "mode": {
+                    "type": "STRING",
+                    "description": "search | news | fetch | compare (default: search).",
+                },
+                "url": {
+                    "type": "STRING",
+                    "description": "Full https URL — required when mode is **fetch**.",
+                },
+                "max_chars": {
+                    "type": "INTEGER",
+                    "description": "For fetch only: max characters of plain text (default 14000, max 40000).",
+                },
+                "items": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Items to compare (compare mode).",
+                },
+                "aspect": {"type": "STRING", "description": "price | specs | reviews (compare mode)."},
             },
-            "required": ["query"]
-        }
+            "required": [],
+        },
     },
     {
         "name": "weather_report",
@@ -241,34 +263,69 @@ TOOL_DECLARATIONS = [
     {
         "name": "send_message",
         "description": (
-            "Sends a real text through WhatsApp, Telegram, or similar (desktop automation). "
-            "Use **only** when the user clearly asks to **send**, **text**, **DM**, or "
-            "**message on [platform]** to someone. Do **not** use for vague social phrases "
-            "like \"say hi to my grandson\" or \"tell Mom hello\" — those are spoken "
-            "in-character greetings, not messaging app actions."
+            "Sends a real message through a **named desktop app** (desktop automation: "
+            "Win key / Mac ``open -a``). Use **only** when the user clearly asks to **send**, "
+            "**email**, **text**, **DM**, or **message on [app]** to someone. Valid "
+            "``platform`` values are the app name as installed, e.g. **Proton Mail**, **Gmail**, "
+            "**WhatsApp**, **Telegram** — **must match what the user asked for**, never assume "
+            "WhatsApp. Do **not** use for vague social phrases like \"say hi to my grandson\" "
+            "or \"tell Mom hello\" — those are spoken in-character greetings, not messaging "
+            "app actions."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "receiver":     {"type": "STRING", "description": "Recipient contact name"},
                 "message_text": {"type": "STRING", "description": "The message to send"},
-                "platform":     {"type": "STRING", "description": "Platform: WhatsApp, Telegram, etc."}
+                "platform":     {
+                    "type": "STRING",
+                    "description": (
+                        "Required. Desktop app to drive, exactly as the user said or as it "
+                        "appears in the Start menu / Applications (e.g. Proton Mail, Gmail, "
+                        "WhatsApp, Telegram)."
+                    ),
+                },
             },
             "required": ["receiver", "message_text", "platform"]
         }
     },
     {
         "name": "reminder",
-        "description": "Sets a timed reminder using Task Scheduler.",
+        "description": (
+            "Schedules notifications via **Windows Task Scheduler** (and one-shot equivalents on "
+            "macOS/Linux). Supports **one-shot** and **recurring** (daily / weekly / weekdays) on "
+            "Windows, **list** / **cancel** of JARVIS* tasks, and optional **open_app_name** to run "
+            "a desktop app after each notification (Windows)."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "date":    {"type": "STRING", "description": "Date in YYYY-MM-DD format"},
-                "time":    {"type": "STRING", "description": "Time in HH:MM format (24h)"},
-                "message": {"type": "STRING", "description": "Reminder message text"}
+                "action": {
+                    "type": "STRING",
+                    "description": "schedule (default) | list | cancel",
+                },
+                "date": {"type": "STRING", "description": "YYYY-MM-DD (schedule)"},
+                "time": {"type": "STRING", "description": "HH:MM 24h clock time for the trigger (schedule)"},
+                "message": {"type": "STRING", "description": "Toast / notification text (schedule)"},
+                "recurrence": {
+                    "type": "STRING",
+                    "description": "once | daily | weekly | weekdays — **Windows only** for non-once.",
+                },
+                "job_name": {
+                    "type": "STRING",
+                    "description": "Short stable id for recurring jobs (becomes JARVISCron_<id>). Required for recurring if you need a predictable cancel name.",
+                },
+                "task_name": {
+                    "type": "STRING",
+                    "description": "Full Task Scheduler name from **action: list** (for cancel).",
+                },
+                "open_app_name": {
+                    "type": "STRING",
+                    "description": "Optional Windows app to **start** after the notification (same names as **open_app**, e.g. notepad, code, msedge).",
+                },
             },
-            "required": ["date", "time", "message"]
-        }
+            "required": [],
+        },
     },
     {
         "name": "youtube_video",

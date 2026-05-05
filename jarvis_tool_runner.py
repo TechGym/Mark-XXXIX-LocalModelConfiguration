@@ -628,6 +628,9 @@ def refine_web_search_args(user_text: str, args: dict) -> dict:
     """Blend user intent + optional site: hint into web_search parameters."""
     if not isinstance(args, dict):
         return args
+    mode = (args.get("mode") or "").strip().lower()
+    if mode in ("fetch", "news"):
+        return args
     raw_q = (args.get("query") or "").strip()
     u = scrub_affirmative_lead((user_text or "").strip())
     ctx = u or raw_q
@@ -642,6 +645,66 @@ def refine_web_search_args(user_text: str, args: dict) -> dict:
         return args
     print(f"[JARVIS] web_search query refined: {raw_q!r} -> {q!r}")
     return {**args, "query": q}
+
+
+def infer_send_message_platform_from_user_text(user_text: str) -> str:
+    """
+    When the model omits ``platform`` (common with plain-text pseudo tool calls),
+    derive the desktop app from the user's words. Returns ``\"\"`` if unclear.
+    """
+    u = (user_text or "").strip().lower()
+    if not u:
+        return ""
+
+    def _has(*phrases: str) -> bool:
+        return any(p in u for p in phrases)
+
+    # Email clients (check before generic "mail")
+    if "protonmail" in u.replace(" ", "") or _has("proton mail"):
+        return "Proton Mail"
+    if re.search(r"\bproton\b", u) and _has("mail", "email"):
+        return "Proton Mail"
+    if _has("gmail", "google mail"):
+        return "Gmail"
+    if _has("outlook", "hotmail", "live.com", "office 365 mail"):
+        return "Outlook"
+    if _has("thunderbird"):
+        return "Thunderbird"
+
+    if _has("whatsapp", "whats app"):
+        return "WhatsApp"
+    if _has("telegram"):
+        return "Telegram"
+    if re.search(r"\bsignal\b", u):
+        return "Signal"
+    if _has("discord"):
+        return "Discord"
+    if "instagram" in u or re.search(r"\binsta\b", u):
+        return "Instagram"
+    if _has("messenger", "facebook message", "fb messenger"):
+        return "Messenger"
+
+    if _has("email", "e-mail") and not re.search(
+        r"\b(slack|teams|zoom|sms|text|dm)\b", u
+    ):
+        # Generic "send an email" with no named client — still ambiguous for automation.
+        return ""
+
+    return ""
+
+
+def refine_send_message_args(user_text: str, args: dict) -> dict:
+    """Fill missing ``platform`` from the user's request when the model left it out."""
+    if not isinstance(args, dict):
+        return args
+    plat = (args.get("platform") or "").strip()
+    if plat:
+        return args
+    inferred = infer_send_message_platform_from_user_text(user_text)
+    if not inferred:
+        return args
+    print(f"[JARVIS] send_message platform inferred from user text: {inferred!r}")
+    return {**args, "platform": inferred}
 
 
 def _line_smells_like_chat_prose(line: str) -> bool:

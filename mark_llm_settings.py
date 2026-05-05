@@ -112,7 +112,7 @@ def get_ollama_model() -> str:
         os.environ.get("MARK_OLLAMA_MODEL", "").strip()
         or os.environ.get("ALETHEON_LLM_ASSIST_OLLAMA_MODEL", "").strip()
         or (_load_config().get("ollama_model") or "").strip()
-        or "llama3.1:8b"
+        or "qwen2.5:7b"
     )
 
 

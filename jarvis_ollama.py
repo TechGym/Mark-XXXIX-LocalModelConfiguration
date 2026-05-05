@@ -21,6 +21,7 @@ from mark_tts import speak_mark_tts
 from jarvis_tool_runner import (
     ollama_tools_from_gemini_declarations,
     parse_tool_arguments,
+    refine_send_message_args,
     refine_web_search_args,
     run_jarvis_tool,
     synthetic_tool_calls_from_text,
@@ -345,13 +346,20 @@ class JarvisOllama:
             "call **web_search** once with a sensible broad query (e.g. "
             "\"top world news today\" or \"US news headlines today\"). Do **not** refuse or "
             "ask them to pick a country first unless they already gave a clear geographic scope.\n"
-            "**Opening / reading a website:** If they ask to **open** a URL, **load** a page, "
-            "or **read** a specific site in a browser (not just search snippets), use "
-            "**browser_control**: ``action: go_to`` with a full **https://…** ``url``, then "
-            "``get_text`` to read visible page text. Do not say you cannot open websites or "
-            "access pages directly — the host can control a browser. Use **web_search** for "
-            "quick headline-style snippets; use **browser_control** when they want the page "
-            "opened or read like a user would.\n"
+            "**Opening / reading a website:** If they ask to **open** a URL in a visible "
+            "browser window or drive the UI, use **browser_control**: ``action: go_to`` with "
+            "a full **https://…** ``url``, then ``get_text`` when they want visible tab text. "
+            "If they only need the **text of a page** without driving the browser, use "
+            "**web_search** with ``mode: \"fetch\"`` and ``url`` (plain-text excerpt). Use "
+            "**web_search** ``mode: \"news\"`` + ``query`` for headline-only news. Use "
+            "**web_search** ``mode: \"search\"`` (default) for general snippets.\n"
+            "**Reminders / cron (Windows):** **reminder** ``action: list`` lists JARVIS* "
+            "scheduled tasks; ``action: cancel`` + ``task_name`` (from list) or ``job_name`` "
+            "(short id for ``JARVISCron_<id>``) removes one. For **recurring** desktop alerts, "
+            "set ``recurrence`` to **daily**, **weekly**, or **weekdays** (Windows Task "
+            "Scheduler), pass ``date``/``time`` for the first anchor, a stable ``job_name``, "
+            "and optional ``open_app_name`` (same tokens as **open_app**, e.g. **notepad**) "
+            "to start an app after each notification.\n"
             "**Read page vs vision:** Short phrases like **read the page**, **read the tab**, "
             "**read it**, or **can you read (the page)?** mean **browser_control** with "
             "``action: get_text`` on the current tab — **not** **screen_process** / vision. "
@@ -389,8 +397,11 @@ class JarvisOllama:
             "If the user asks you to greet someone by name (e.g. \"say hi to my grandson "
             "Cayden\"), speak that greeting **in character** through your voice only. "
             "Do **not** call **send_message** unless they explicitly ask to **send**, "
-            "**text**, **DM**, or **message on WhatsApp/Telegram/etc.** — short social "
-            "greetings are **not** desktop messaging tasks."
+            "**text**, **email**, **DM**, or **message on [named app]** — short social "
+            "greetings are **not** desktop messaging tasks.\n"
+            "**send_message:** Always pass **platform** as the desktop app they named "
+            "(e.g. Proton Mail, Gmail, WhatsApp). Never omit **platform** and never default "
+            "to WhatsApp when they asked for email or another client."
         )
         tail = assistant_persona_final_override(memory)
         if tail:
@@ -490,7 +501,7 @@ class JarvisOllama:
                 if code == 400:
                     self.ui.write_log(
                         "SYS: Ollama HTTP 400 with tools — retrying without tools. "
-                        "Pick a model that supports tools (e.g. llama3.1:8b) in OLLAMA MODEL."
+                        "Pick a model that supports tools (e.g. qwen2.5:7b, llama3.2:3b) in OLLAMA MODEL."
                         + (f" Detail: {hint}" if hint else "")
                     )
                 else:
@@ -603,6 +614,8 @@ class JarvisOllama:
                     args = parse_tool_arguments(fn.get("arguments"))
                     if tname == "web_search" and isinstance(args, dict):
                         args = refine_web_search_args(user_text, args)
+                    if tname == "send_message" and isinstance(args, dict):
+                        args = refine_send_message_args(user_text, args)
                     print(f"[JARVIS] 📞 {tname}")
                     out = await run_jarvis_tool(
                         tname,

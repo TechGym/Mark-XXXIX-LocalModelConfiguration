@@ -942,7 +942,7 @@ class SetupOverlay(QWidget):
         layout.addWidget(self._ollama_url)
         layout.addWidget(_lbl("Model tag", 8, color=C.TEXT_DIM,
                                align=Qt.AlignmentFlag.AlignLeft))
-        self._ollama_model = QLineEdit("llama3.1:8b")
+        self._ollama_model = QLineEdit("qwen2.5:7b")
         self._ollama_model.setFont(QFont("Courier New", 9))
         self._ollama_model.setFixedHeight(28)
         self._ollama_model.setStyleSheet(_le_style)
@@ -1749,7 +1749,7 @@ class MainWindow(QMainWindow):
                 data = {}
         if use_ollama:
             o_url = "http://127.0.0.1:11434"
-            o_model = "llama3.1:8b"
+            o_model = "qwen2.5:7b"
             if self._overlay:
                 o_url = (self._overlay._ollama_url.text().strip() or o_url)
                 o_model = (self._overlay._ollama_model.text().strip() or o_model)
@@ -1808,7 +1808,7 @@ class MainWindow(QMainWindow):
                 names = list_ollama_models()
                 cur = get_ollama_model()
             except Exception:
-                names, cur = [], "llama3.1:8b"
+                names, cur = [], "qwen2.5:7b"
             self._ollama_models_sig.emit(names, cur)
 
         threading.Thread(target=work, daemon=True).start()

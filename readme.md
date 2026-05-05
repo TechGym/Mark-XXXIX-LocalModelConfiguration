@@ -38,6 +38,12 @@ It's not just an assistant — it's an extension of your digital life.
 - 🦙 **Local Ollama path (enhanced)** — Run without a Gemini API key for **chat**: **Ollama `/api/chat`** for tools + chat, **faster-whisper** for PTT speech-to-text, **separate vision model** for screen/camera and `screen_find`. Spoken replies can use **Windows SAPI (`pyttsx3`)**, **Gemini neural TTS** (cloud; needs `gemini_api_key` for speech only), or **Coqui local TTS** (see below).
 - 🔊 **VOICE OUTPUT (LOCAL)** — In Ollama mode the right panel picks **`tts_backend`**: **Windows (SAPI)**, **Gemini neural**, or **Coqui local**. Gemini: prebuilt voice names (Charon, Kore, …) → `gemini_live_voice`. **Coqui**: clone root + **registry model presets** (editable combo), optional **Gemini-after-Coqui** checkbox, settings saved to `config/api_keys.json`. **`mark_tts.py`** routes backends; **`mark_coqui_tts.py`** runs Coqui + **sounddevice**; Gemini path keeps **429 / quota** fallbacks to SAPI.
 - 🐸 **Coqui / TechGym-TTS (local neural)** — Optional **low-latency** speech vs Gemini TTS (no per-utterance HTTP; GPU-friendly once PyTorch is CUDA-enabled). See **[Coqui local TTS (recommended for speed)](#coqui-local-tts-recommended-for-speed)** below.
+- 🌐 **Web research upgrade** — `web_search` now supports:
+  - `mode: "search"` for general snippets (default),
+  - `mode: "news"` for headline-focused results,
+  - `mode: "fetch"` with `url` for plain-text page extraction,
+  - `mode: "compare"` for side-by-side comparisons.
+- ⏰ **Reminder + cron controls (Windows-first)** — `reminder` now supports `action: "schedule" | "list" | "cancel"`, recurring schedules (`daily`, `weekly`, `weekdays` on Windows Task Scheduler), optional stable `job_name`, and optional `open_app_name` to launch/focus a desktop app after each reminder fires.
 
 ---
 
@@ -89,7 +95,7 @@ This fork adds a complete **local stack** alongside the original Gemini Live pat
 ### Setup checklist
 
 1. Start **`ollama serve`** (or the Ollama app).
-2. **`ollama pull`** a chat model (e.g. **`llama3.1:8b`**, `qwen2.5-coder:7b`) and a vision model (e.g. **`llava`**).
+2. **`ollama pull`** a chat model (e.g. **`qwen2.5:7b`**, `qwen2.5-coder:7b`) and a vision model (e.g. **`llava`**).
 3. **`pip install -r requirements.txt`** and **`playwright install`**.
 4. Run **`python main.py`** and choose **CONNECT LOCAL OLLAMA** in the setup overlay (or set `MARK_LLM_PROVIDER=ollama` and configure `config/api_keys.json`). **`config/api_keys.json` is gitignored** — do not commit your keys.
 

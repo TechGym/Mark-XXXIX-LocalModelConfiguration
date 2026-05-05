@@ -164,6 +164,68 @@ def _collect_ddg_with_domain_variants(query: str, *, max_results: int = 8) -> li
     return out[:max_results]
 
 
+def _is_safe_http_url(url: str) -> bool:
+    u = (url or "").strip()
+    if not u or len(u) > 2048:
+        return False
+    low = u.lower()
+    return low.startswith("https://") or low.startswith("http://")
+
+
+def _html_to_plain_text(html: str, *, max_chars: int) -> str:
+    """Cheap HTML → text (no extra deps)."""
+    if not html:
+        return ""
+    t = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
+    t = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", t)
+    t = re.sub(r"(?is)<br\s*/?>", "\n", t)
+    t = re.sub(r"(?is)</p>", "\n", t)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = re.sub(r"[ \t\r\f\v]+", " ", t)
+    t = re.sub(r"\n\s*\n+", "\n", t).strip()
+    return t[:max_chars]
+
+
+def fetch_url_as_text(url: str, *, timeout: int = 25, max_bytes: int = 600_000, max_chars: int = 14_000) -> str:
+    """
+    Fetch a single public web page and return plain-text excerpt (for ``mode: fetch``).
+    """
+    if not _is_safe_http_url(url):
+        return "Invalid or unsupported URL — only http(s) links up to 2048 chars are allowed."
+    try:
+        req = Request(
+            url.strip(),
+            headers={
+                "User-Agent": (
+                    "Mark-XXXIX/1.0 (read page for assistant; "
+                    "+https://github.com/denalidao/Mark-XXXIX)"
+                ),
+                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raw = raw[:max_bytes]
+        html = raw.decode("utf-8", errors="replace")
+    except (HTTPError, URLError, OSError, TimeoutError, ValueError) as e:
+        return f"Could not fetch URL: {e}"
+
+    title = ""
+    t_m = re.search(r"(?is)<title[^>]*>([^<]{1,400})", html)
+    if t_m:
+        title = _strip_html_snippet(t_m.group(1))[:300]
+    body = _html_to_plain_text(html, max_chars=max_chars)
+    if not body and not title:
+        return "Fetched the page but could not extract readable text."
+    parts = [f"URL: {url.strip()}"]
+    if title:
+        parts.append(f"Title: {title}")
+    parts.append("")
+    parts.append(body or "(empty body after stripping HTML)")
+    return "\n".join(parts).strip()
+
+
 def _fetch_homepage_snippet(hostname: str, *, timeout: int = 18, max_bytes: int = 400_000) -> list[dict]:
     """
     Last resort: GET ``https://{host}/`` (and ``www``) and build one pseudo search row
@@ -294,6 +356,42 @@ def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
     return out[:max_results]
 
 
+def _ddg_news_only(query: str, *, max_results: int = 10) -> list[dict]:
+    """Headlines only (DDG news index), for ``mode: news``."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    with DDGS() as ddgs:
+        try:
+            for r in ddgs.news(
+                query,
+                max_results=max_results,
+                safesearch="off",
+                region="us-en",
+            ):
+                url = (r.get("url") or "").strip()
+                key = url or (r.get("title") or "").strip()[:120]
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append(
+                    {
+                        "title": r.get("title", ""),
+                        "snippet": r.get("body", ""),
+                        "url": url,
+                    }
+                )
+                if len(out) >= max_results:
+                    break
+        except Exception as exc:
+            print(f"[WebSearch] ⚠️ DDG news-only: {exc}")
+    return out
+
+
 def _format_ddg(query: str, results: list[dict]) -> str:
     if not results:
         return (
@@ -348,17 +446,42 @@ def _compare(items: list[str], aspect: str) -> str:
 def web_search(
     parameters:     dict,
     response=None,
-    player=None,
     session_memory=None,
 ) -> str:
     params = parameters or {}
-    query  = params.get("query", "").strip()
-    mode   = params.get("mode",  "search").lower().strip()
-    items  = params.get("items", [])
-    aspect = params.get("aspect", "general").strip() or "general"
+    query = (params.get("query") or "").strip()
+    mode = (params.get("mode") or "search").lower().strip()
+    items = params.get("items", [])
+    aspect = (params.get("aspect") or "general").strip() or "general"
+    url = (params.get("url") or "").strip()
+    max_chars = params.get("max_chars")
+    try:
+        max_chars_i = int(max_chars) if max_chars is not None else 14_000
+    except (TypeError, ValueError):
+        max_chars_i = 14_000
+    max_chars_i = max(2_000, min(max_chars_i, 40_000))
+
+    if mode == "fetch":
+        if not url:
+            return "For mode **fetch**, provide a non-empty **url** (https://…)."
+        if player:
+            player.write_log(f"[Search] fetch {url[:120]}")
+        print(f"[WebSearch] 📄 Fetch URL mode: {url!r}")
+        return fetch_url_as_text(url, max_chars=max_chars_i)
+
+    if mode == "news":
+        if not query:
+            return "For mode **news**, provide a **query** (topic or outlet)."
+        if player:
+            player.write_log(f"[Search] news {query}")
+        print(f"[WebSearch] 📰 News mode: {query!r}")
+        rows = _ddg_news_only(query, max_results=10)
+        if not rows and _query_suggests_news_rss_fallback(query):
+            rows = _news_rss_fallback_results(query, max_results=10)
+        return _format_ddg(query, rows)
 
     if not query and not items:
-        return "Please provide a search query, sir."
+        return "Please provide a search **query** (or use mode **fetch** with **url**)."
 
     if items and mode != "compare":
         mode = "compare"
