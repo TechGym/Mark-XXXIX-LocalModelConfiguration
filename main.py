@@ -4,6 +4,8 @@ import re
 import threading
 import json
 import sys
+import shutil
+import subprocess
 import traceback
 from pathlib import Path
 
@@ -988,5 +990,60 @@ def main():
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()
 
+
+def _maybe_relaunch_for_coqui_env() -> None:
+    """
+    If Coqui TTS is selected but the active conda env is not ``mark-coqui``,
+    relaunch this script under ``conda run -n mark-coqui``.
+
+    Note: Python cannot reliably "activate" conda in-process; relaunch is robust.
+    """
+    try:
+        from mark_llm_settings import get_local_tts_backend
+    except Exception:
+        return
+
+    if get_local_tts_backend() != "coqui":
+        return
+
+    if os.environ.get("MARK_SKIP_COQUI_RELAUNCH", "").strip() == "1":
+        return
+
+    env_name = (os.environ.get("CONDA_DEFAULT_ENV") or "").strip()
+    if env_name.lower() == "mark-coqui":
+        # Helpful startup verification in the target env.
+        try:
+            import torch  # type: ignore[import-not-found]
+
+            ok = bool(torch.cuda.is_available())
+            print(f"[TTS] Coqui preflight: env=mark-coqui, torch={torch.__version__}, cuda={ok}")
+            if not ok:
+                print(
+                    '[TTS] CUDA is false in mark-coqui. Verify with: '
+                    'conda activate mark-coqui | python -c "import torch; print(torch.__version__, torch.cuda.is_available())"'
+                )
+        except Exception as ex:
+            print(f"[TTS] Coqui preflight: could not import torch in mark-coqui ({ex}).")
+        return
+
+    conda_bin = shutil.which("conda")
+    if not conda_bin:
+        print(
+            "[TTS] Coqui is enabled but conda is not on PATH; cannot auto-switch env. "
+            'Run manually: conda activate mark-coqui | python -c "import torch; print(torch.__version__, torch.cuda.is_available())"'
+        )
+        return
+
+    cmd = [conda_bin, "run", "-n", "mark-coqui", sys.executable, *sys.argv[1:]]
+    child_env = os.environ.copy()
+    child_env["MARK_SKIP_COQUI_RELAUNCH"] = "1"
+    print(
+        "[TTS] Coqui is enabled and current env is not mark-coqui. "
+        "Relaunching under: conda run -n mark-coqui ..."
+    )
+    proc = subprocess.run(cmd, env=child_env)
+    raise SystemExit(proc.returncode)
+
 if __name__ == "__main__":
+    _maybe_relaunch_for_coqui_env()
     main()

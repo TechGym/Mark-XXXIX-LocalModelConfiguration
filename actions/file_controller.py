@@ -16,6 +16,28 @@ _SAFE_ROOTS: list[Path] = [
     Path.home(),
 ]
 
+_PROTECTED_PATHS: list[Path] = [
+    Path(
+        r"C:\Users\RacerX\.cursor\projects\c-Users-RacerX-Denali-Development-MetaGPT\agent-transcripts"
+    ),
+]
+
+
+def _is_protected_path(target: Path) -> bool:
+    """
+    True when ``target`` is the protected transcript directory or anything inside it.
+    """
+    try:
+        resolved = target.resolve()
+        for root in _PROTECTED_PATHS:
+            root_resolved = root.resolve()
+            if resolved == root_resolved or resolved.is_relative_to(root_resolved):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _is_safe_path(target: Path) -> bool:
     """Verilen path _SAFE_ROOTS içinde mi? Değilse işlemi reddet."""
     try:
@@ -166,6 +188,8 @@ def delete_file(path: str, name: str = "") -> str:
         target = (base / name) if name else base
         if not _is_safe_path(target):
             return f"Access denied: {target}"
+        if _is_protected_path(target):
+            return f"Protected path, cannot delete: {target}"
         if not target.exists():
             return f"Not found: {target.name}"
 
@@ -199,6 +223,10 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
             return f"Access denied (source): {src}"
         if not _is_safe_path(dst):
             return f"Access denied (destination): {dst}"
+        if _is_protected_path(src):
+            return f"Protected path, cannot move source: {src}"
+        if _is_protected_path(dst):
+            return f"Protected path, cannot move into destination: {dst}"
 
         if dst.is_dir():
             dst = dst / src.name
@@ -248,6 +276,8 @@ def rename_file(path: str, name: str = "", new_name: str = "") -> str:
         target   = (base / name) if name else base
         if not _is_safe_path(target):
             return f"Access denied: {target}"
+        if _is_protected_path(target):
+            return f"Protected path, cannot rename: {target}"
         if not target.exists():
             return f"Not found: {target.name}"
         if not new_name:

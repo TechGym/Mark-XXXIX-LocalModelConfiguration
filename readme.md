@@ -109,6 +109,12 @@ This fork adds a complete **local stack** alongside the original Gemini Live pat
 
 **Why use it:** Gemini TTS is **simple to set up** but pays **network + API latency** on every line and can hit **429 / quota** (then you hear SAPI). **Coqui** runs **on your machine**; after the model is cached, replies are typically **much faster** and work **offline** for speech (you still use Ollama for chat).
 
+> ⚠️ **Important (active environment):** If you use CUDA with local Coqui TTS, Mark must be started from the **same conda environment** that has CUDA-enabled PyTorch + Coqui dependencies (for example `mark-coqui`).  
+> Validate before launch:  
+> `conda activate mark-coqui`  
+> `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`  
+> If this prints `False`, Coqui will run CPU-only or fall back to SAPI depending on your setup.
+
 **Requirements (Windows example):**
 
 1. **Separate conda env** (e.g. `mark-coqui`) with **Python 3.11** if your default is 3.12 — TechGym / Coqui **editable** `pip install -e .` often rejects 3.12 in `setup.py`.
