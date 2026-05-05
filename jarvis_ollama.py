@@ -206,6 +206,90 @@ def _coerce_screen_process_to_browser_read(
     return out
 
 
+def _user_means_physical_camera_vision(user_text: str) -> bool:
+    """
+    Questions about objects **in front of the user**, in their **hands**, or on the
+    desk from the webcam — need ``screen_process`` with ``angle: camera``, not the
+    monitor capture and not asking the user to \"describe the screen\".
+    """
+    t = (user_text or "").strip()
+    if not t or len(t) > 220:
+        return False
+    tl = t.lower()
+    if re.search(r"(?i)\bwhat'?s?\s+on\s+(my\s+)?(screen|monitor|display)\b", tl):
+        return False
+    if re.search(r"(?i)\b(this|the)\s+tab\b", tl) and not re.search(
+        r"(?i)\b(hand|hold|holding|desk|front\s+of)\b", tl
+    ):
+        return False
+    if re.search(r"(?i)\bwhat\s+do\s+i\s+have\s+in\s+front\s+of\s+me\b", tl):
+        return True
+    if re.search(r"(?i)\bwhat\s+'s\s+in\s+front\s+of\s+me\b", tl):
+        return True
+    if re.search(r"(?i)\bwhat\s+have\s+i\s+got\s+in\s+front\s+of\s+me\b", tl):
+        return True
+    if re.search(r"(?i)\bwhat\s+am\s+i\s+holding\b", tl):
+        return True
+    if re.search(r"(?i)\bwhat\s+(is|'s)\s+in\s+my\s+hand\b", tl):
+        return True
+    if re.search(r"(?i)\bwhat\s+do\s+i\s+have\s+in\s+my\s+hand\b", tl):
+        return True
+    if re.search(r"(?i)\b(in\s+my\s+hand|in\s+this\s+hand)\b", tl) and re.search(
+        r"(?i)\b(what|see|tell|look|identify)\b", tl
+    ):
+        return True
+    if re.search(r"(?i)\bin\s+front\s+of\s+me\b", tl) and re.search(
+        r"(?i)\bon\s+(my\s+)?screen\b", tl
+    ):
+        return False
+    if re.search(r"(?i)\bin\s+front\s+of\s+me\b", tl) and re.search(
+        r"(?i)\b(what|see|tell|identify|recognize|have\s+i\s+got)\b", tl
+    ):
+        return True
+    if re.search(r"(?i)\b(can\s+you\s+)?see\s+what\s+i\s+('m\s+)?holding\b", tl):
+        return True
+    if re.search(r"(?i)\blook\s+at\s+what\s+i\s+('m\s+)?holding\b", tl):
+        return True
+    return False
+
+
+def _ensure_camera_angle_for_hands_questions(
+    user_text: str, tool_calls: list[dict]
+) -> list[dict]:
+    """If the model used ``screen_process`` but defaulted ``angle`` to screen, switch to camera."""
+    if not tool_calls or not _user_means_physical_camera_vision(user_text):
+        return tool_calls
+    out: list[dict] = []
+    changed = False
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            out.append(tc)
+            continue
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        if name != "screen_process":
+            out.append(tc)
+            continue
+        args = parse_tool_arguments(fn.get("arguments"))
+        if not isinstance(args, dict):
+            args = {}
+        ang = str(args.get("angle", "screen") or "screen").lower().strip()
+        if ang == "camera":
+            out.append(tc)
+            continue
+        q = (args.get("text") or "").strip() or user_text
+        changed = True
+        row = dict(tc)
+        row["function"] = {
+            "name": "screen_process",
+            "arguments": {"angle": "camera", "text": q},
+        }
+        out.append(row)
+    if changed:
+        print("[JARVIS] Physical-scene intent: screen_process angle=camera.")
+    return out
+
+
 class JarvisOllama:
     """
     Ollama-powered assistant loop (Aletheon-style HTTP to ``/api/chat``).
@@ -265,8 +349,13 @@ class JarvisOllama:
             "**Read page vs vision:** Short phrases like **read the page**, **read the tab**, "
             "**read it**, or **can you read (the page)?** mean **browser_control** with "
             "``action: get_text`` on the current tab — **not** **screen_process** / vision. "
-            "Use **screen_process** only when they ask what is on their **screen**, "
-            "**monitor**, **camera**, or for a **screenshot** / image description.\n"
+            "Use **screen_process** with ``angle: \"screen\"`` when they mean the **monitor** "
+            "(what's on my screen, this window, browser tab as pixels).\n"
+            "**Webcam / hands / desk:** If they ask what they **hold**, what is **in front of "
+            "them**, **in my hand**, **on my desk** (physical object), or **what do I have "
+            "here** in a face-to-camera sense, call **screen_process** with ``angle: "
+            "\"camera\"`` and put their exact question in ``text``. Do **not** ask them to "
+            "describe the monitor — you must call the tool; the vision model sees the webcam.\n"
             "Never refuse \"read the page\" for policy reasons when **browser_control** exists; "
             "call ``get_text`` and summarize the tool output.\n"
             "Never print fake tool lines like ``web_search(query=...)``, "
@@ -437,7 +526,30 @@ class JarvisOllama:
             if (
                 len(messages) == 2
                 and not tool_calls
+                and _user_means_physical_camera_vision(user_text)
+                and "screen_process" in valid_names
+            ):
+                tool_calls = [
+                    {
+                        "function": {
+                            "name": "screen_process",
+                            "arguments": {
+                                "angle": "camera",
+                                "text": user_text,
+                            },
+                        }
+                    }
+                ]
+                content = ""
+                self.ui.write_log(
+                    "SYS: Webcam / physical scene — invoking screen_process (camera)."
+                )
+
+            if (
+                len(messages) == 2
+                and not tool_calls
                 and _user_means_read_browser_page(user_text)
+                and not _user_means_physical_camera_vision(user_text)
                 and "browser_control" in valid_names
             ):
                 tool_calls = [
@@ -457,6 +569,9 @@ class JarvisOllama:
                 tool_calls = _coerce_screen_process_to_browser_read(
                     user_text, tool_calls, valid_names=valid_names
                 )
+                tool_calls = _ensure_camera_angle_for_hands_questions(
+                    user_text, tool_calls
+                )
 
             assistant_msg: dict = {"role": "assistant", "content": content}
             if tool_calls:
@@ -465,6 +580,14 @@ class JarvisOllama:
 
             if tool_calls:
                 loop = asyncio.get_running_loop()
+                tool_names_round = [
+                    ((tc.get("function") or {}).get("name") or "").strip()
+                    for tc in tool_calls
+                    if isinstance(tc, dict)
+                ]
+                only_vision = bool(tool_names_round) and all(
+                    n == "screen_process" for n in tool_names_round
+                )
                 for tc in tool_calls:
                     fn = tc.get("function") or {}
                     tname = fn.get("name") or ""
@@ -493,6 +616,12 @@ class JarvisOllama:
                     if tid:
                         tool_entry["tool_call_id"] = str(tid)
                     messages.append(tool_entry)
+                if only_vision:
+                    self.ui.write_log(
+                        "SYS: Vision running in background — skipping extra chat reply "
+                        "(Jarvis (vision) will speak when ready)."
+                    )
+                    return
                 continue
 
             if content:

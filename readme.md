@@ -35,8 +35,9 @@ It's not just an assistant — it's an extension of your digital life.
 - 🎨 **Adaptive & Flexible UI** — A complete overhaul of the interface. The new UI is fully resizable and responsive, featuring transparency controls and customizable layouts to fit your workspace perfectly.
 - 🐧🍎 **Refined Cross-Platform Stability** — Major fixes for macOS and Linux compatibility. Core system actions are now more consistent across all three major operating systems.
 - ⚡ **Optimized Core Engine** — Significant performance boost in tool-calling logic and response generation, resulting in a 40% faster interaction speed.
-- 🦙 **Local Ollama path (enhanced)** — Run without a Gemini API key for **chat**: **Ollama `/api/chat`** for tools + chat, **faster-whisper** for PTT speech-to-text, **separate vision model** for screen/camera and `screen_find`. Spoken replies can use **Windows SAPI (`pyttsx3`)** or **Gemini neural TTS** (same `google.genai` stack as the rest of the project; needs `gemini_api_key` only for speech while chat stays local).
-- 🔊 **VOICE OUTPUT (LOCAL)** — In Ollama mode the right panel lets you pick **Windows (SAPI)** vs **Gemini neural**, choose a **prebuilt Gemini voice** (Charon, Kore, …), and persists `tts_backend` / `gemini_live_voice` to `config/api_keys.json`. Picking a Gemini voice auto-selects neural TTS when a key is present. **`mark_tts.py`** handles synthesis, **base64-safe** audio handling, and **429 / quota** fallbacks (retries an alternate TTS model before falling back to SAPI).
+- 🦙 **Local Ollama path (enhanced)** — Run without a Gemini API key for **chat**: **Ollama `/api/chat`** for tools + chat, **faster-whisper** for PTT speech-to-text, **separate vision model** for screen/camera and `screen_find`. Spoken replies can use **Windows SAPI (`pyttsx3`)**, **Gemini neural TTS** (cloud; needs `gemini_api_key` for speech only), or **Coqui local TTS** (see below).
+- 🔊 **VOICE OUTPUT (LOCAL)** — In Ollama mode the right panel picks **`tts_backend`**: **Windows (SAPI)**, **Gemini neural**, or **Coqui local**. Gemini: prebuilt voice names (Charon, Kore, …) → `gemini_live_voice`. **Coqui**: clone root + **registry model presets** (editable combo), optional **Gemini-after-Coqui** checkbox, settings saved to `config/api_keys.json`. **`mark_tts.py`** routes backends; **`mark_coqui_tts.py`** runs Coqui + **sounddevice**; Gemini path keeps **429 / quota** fallbacks to SAPI.
+- 🐸 **Coqui / TechGym-TTS (local neural)** — Optional **low-latency** speech vs Gemini TTS (no per-utterance HTTP; GPU-friendly once PyTorch is CUDA-enabled). See **[Coqui local TTS (recommended for speed)](#coqui-local-tts-recommended-for-speed)** below.
 
 ---
 
@@ -61,7 +62,7 @@ python main.py
 | Requirement | Details |
 |---|---|
 | **OS** | Windows 10/11, macOS, or Linux |
-| **Python** | 3.11 or 3.12 |
+| **Python** | **3.11+** for the app; **Coqui / TechGym-TTS** editable installs typically require **Python 3.11** (upstream constraint: 3.9–3.11). Use a **separate conda env** for Mark+Coqui if your global Python is 3.12 |
 | **Microphone** | Required for Gemini Live; optional for **local Ollama** unless you use **PTT** (then needed for capture) |
 | **API Key** | Optional if you use **local Ollama** instead of Gemini (see below) |
 | **[Ollama](https://ollama.com)** | For local mode: daemon on **`http://127.0.0.1:11434`** by default; pull at least one **chat** model and one **vision** model (e.g. `llava`) for full screen features |
@@ -79,8 +80,9 @@ This fork adds a complete **local stack** alongside the original Gemini Live pat
 | **Ollama chat model** (dropdown / `ollama_model`) | Reasoning, tool calls, replies via `POST /api/chat` |
 | **Ollama vision model** (`MARK_OLLAMA_VISION_MODEL` or `ollama_vision_model`, default **`llava`**) | `screen_process`, webcam/screen questions, and **`screen_find`** — independent of the chat tag |
 | **faster-whisper** (PTT) | Converts microphone audio to text; **first run** may download Whisper weights (separate from `ollama pull`) |
-| **Voice output** (`tts_backend`) | **`pyttsx3`** — Windows SAPI (optional `tts_voice_substring` / `MARK_TTS_VOICE` to pick e.g. Zira). **`gemini`** — `generate_content` on a **TTS model** with a **prebuilt voice**; audio plays via **sounddevice** (same PortAudio path as `main.py`). |
-| **`mark_tts.py`** | Chooses Gemini vs SAPI, calls Gemini TTS, normalizes API audio blobs, and logs quota / fallback reasons to the console. |
+| **Voice output** (`tts_backend`) | **`pyttsx3`** — Windows SAPI (optional `tts_voice_substring` / `MARK_TTS_VOICE`). **`gemini`** — cloud Gemini TTS + prebuilt voice; **sounddevice** playback; subject to **latency and quota**. **`coqui`** — **local** Coqui / TechGym-TTS (**`mark_coqui_tts.py`**); **sounddevice** playback; **SAPI** still used if Coqui is not configured or fails. |
+| **`mark_tts.py`** | Routes **Coqui → (optional Gemini) → SAPI** per settings; Gemini HTTP + audio normalization + quota logging. |
+| **`mark_coqui_tts.py`** | Loads **`TTS`** (clone path or pip-installed), blocks **Tortoise** model ids, **CPU/GPU** clamping, **init-failure cache** (no repeated heavy load every utterance), diagnostics. |
 
 **Audio I/O:** The project uses **`sounddevice`** (PortAudio), not PyAudio.
 
@@ -94,10 +96,30 @@ This fork adds a complete **local stack** alongside the original Gemini Live pat
 ### UI in local mode
 
 - **OLLAMA MODEL** — Populated from **`GET /api/tags`**. Changing it saves to `config/api_keys.json`. Use **↻** after `ollama pull`.
-- **VOICE OUTPUT (LOCAL)** — First dropdown: **Windows (SAPI / pyttsx3)** or **Gemini neural (uses API key)** → saves **`tts_backend`**. Second dropdown: **Gemini voice** (prebuilt names) → saves **`gemini_live_voice`**. You need **`gemini_api_key`** in `api_keys.json` for neural output; chat still uses Ollama. Activity log shows e.g. `SYS: Voice output → gemini, Gemini voice=Kore`. If **`MARK_TTS_BACKEND`** is set in the environment, it **overrides** the file — the UI hint mentions this.
+- **VOICE OUTPUT (LOCAL)** — Backend: **Windows (SAPI)** | **Gemini neural** | **Coqui local**. **Gemini neural** shows the **Gemini voice** dropdown (Charon, Kore, …). **Coqui** shows **clone root** + **model registry** (preset combo, still type custom ids) and **“If Coqui fails, try Gemini TTS”** (writes `coqui_failover_to_gemini`). Chat stays on **Ollama** regardless. **`MARK_TTS_BACKEND`** overrides `tts_backend` when set (see env table).
 - **LOCAL VOICE (PTT)** — Appears when the Ollama backend is online: **hold** the button, speak, **release** to transcribe and send text to the **chat** model.
 
-### Hybrid voice: Ollama chat + Gemini TTS (recommended flow)
+### Coqui local TTS (recommended for speed)
+
+**Why use it:** Gemini TTS is **simple to set up** but pays **network + API latency** on every line and can hit **429 / quota** (then you hear SAPI). **Coqui** runs **on your machine**; after the model is cached, replies are typically **much faster** and work **offline** for speech (you still use Ollama for chat).
+
+**Requirements (Windows example):**
+
+1. **Separate conda env** (e.g. `mark-coqui`) with **Python 3.11** if your default is 3.12 — TechGym / Coqui **editable** `pip install -e .` often rejects 3.12 in `setup.py`.
+2. **Clone** [coqui-ai/TTS](https://github.com/coqui-ai/TTS) or your fork (e.g. **TechGym-TTS-scout**), then from that directory:  
+   `pip install -e .`  
+   (Use the **same env** as `python main.py`.)
+3. **PyTorch with CUDA** in that env if you have an NVIDIA GPU — the **CPU-only** wheel (`torch … +cpu`) makes Coqui assert on `gpu=True`. Install from [PyTorch Get Started](https://pytorch.org/get-started/locally/) (e.g. `cu124` wheels) and verify:  
+   `python -c "import torch; print(torch.cuda.is_available())"` → **`True`**.
+4. **NumPy / OpenCV:** Coqui’s **`gruut`** expects **NumPy 1.x** (not 2.x); some **`opencv-python`** releases pull **NumPy 2.x**. If `pip` reports conflicts, pin e.g. **`numpy>=1.26,<2`** and **`opencv-python>=4.8,<4.12`** in that env.
+5. **`config/api_keys.json`** (gitignored): set **`tts_backend`** to **`coqui`**, **`coqui_model_name`** (registry id, e.g. `tts_models/en/jenny/jenny` or `tts_models/en/ljspeech/tacotron2-DDC`), and optionally **`coqui_tts_repo_path`** (absolute path to clone root containing **`TTS/`**). If the path is empty, Mark imports **`TTS`** from the environment (after `pip install -e`).
+6. **`coqui_use_cuda`:** Mark **turns GPU off automatically** if PyTorch reports no CUDA (avoids a hard assert). Set **`coqui_use_cuda`: false** explicitly on CPU-only machines.
+
+**Optional cloud bridge:** With **`coqui_failover_to_gemini`: true** and a **`gemini_api_key`**, a Coqui miss can try **Gemini TTS** before SAPI — keys stay in the file; you choose the chain in the UI.
+
+**After changing Coqui settings:** save in the UI (or restart) so the **Coqui engine cache** resets. If init failed once, Mark **does not** repeat a full heavy load every utterance until you fix config and reset.
+
+### Hybrid voice: Ollama chat + Gemini TTS (optional flow)
 
 1. Use **local Ollama** setup so the **OLLAMA MODEL** and voice panels are visible.
 2. Add a **`gemini_api_key`** to `config/api_keys.json` (same key as full Gemini mode; file stays gitignored).
@@ -105,7 +127,7 @@ This fork adds a complete **local stack** alongside the original Gemini Live pat
 4. Pick a **Gemini voice** (e.g. Kore, Charon). That sets **`gemini_live_voice`**.
 5. Restart **`python main.py`** after hand-editing JSON if you bypass the UI.
 
-**Config keys (local speech):** `tts_backend` (`gemini` | `pyttsx3`), `gemini_live_voice`, optional `gemini_tts_model` (default **`gemini-2.5-flash-preview-tts`**, with automatic retry on 429 to **`gemini-3.1-flash-tts-preview`**; override with **`MARK_GEMINI_TTS_MODEL`**), optional `tts_voice_substring` for SAPI when on Windows mode.
+**Config keys (local speech):** `tts_backend` (`gemini` | `pyttsx3` | `coqui`), `gemini_live_voice`, optional `gemini_tts_model` (default **`gemini-2.5-flash-preview-tts`**, with automatic retry on 429 to **`gemini-3.1-flash-tts-preview`**; override with **`MARK_GEMINI_TTS_MODEL`**), optional `tts_voice_substring` for SAPI when on Windows mode. **Coqui:** `coqui_tts_repo_path`, `coqui_model_name`, optional `coqui_model_path` / `coqui_config_path`, `coqui_use_cuda`, `coqui_failover_to_gemini`, optional `coqui_speaker` / `coqui_language` for multi-speaker / multilingual models.
 
 ### Gemini TTS quotas and billing
 
@@ -133,7 +155,11 @@ Optional; Aletheon-style names are supported where noted.
 | `ALETHEON_LLM_ASSIST_OLLAMA_MODEL` | Same as `MARK_OLLAMA_MODEL` if the latter is unset. |
 | `MARK_OLLAMA_VISION_MODEL` | Vision tag for screen/camera / `screen_find`; default **`llava`** if unset. |
 | `MARK_DISABLE_TTS` | `1` / `true` to skip spoken replies in local mode. |
-| `MARK_TTS_BACKEND` | `gemini` or `pyttsx3` — **overrides** `tts_backend` in `api_keys.json` when set. |
+| `MARK_TTS_BACKEND` | `gemini`, `pyttsx3`, or `coqui` — **overrides** `tts_backend` in `api_keys.json` when set. |
+| `MARK_COQUI_REPO` | Optional: overrides **`coqui_tts_repo_path`** when non-empty after trim. |
+| `MARK_COQUI_MODEL_NAME` | Optional: overrides **`coqui_model_name`**. |
+| `MARK_COQUI_CUDA` | `cpu` / `false` / `0` or `cuda` / `true` / `1` — overrides **`coqui_use_cuda`** when set. |
+| `MARK_COQUI_FAILOVER_TO_GEMINI` | `true` / `false` — overrides **`coqui_failover_to_gemini`**. |
 | `MARK_GEMINI_TTS_MODEL` | TTS model id for Gemini speech (overrides `gemini_tts_model` in JSON). |
 | `MARK_GEMINI_VOICE` / `GEMINI_LIVE_VOICE` | Prebuilt Gemini voice name (overrides `gemini_live_voice` in JSON). |
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Same keys as cloud Gemini; used for **Gemini TTS** in hybrid mode. |
@@ -154,7 +180,7 @@ Gemini **Live** (mic streamed to the model, native audio) still requires the Gem
 | Local assistant loop + PTT queue | `jarvis_ollama.py`, `main.py` |
 | Tool runner (Ollama branches) | `jarvis_tool_runner.py` |
 | Speech-to-text | `mark_voice.py` |
-| Local TTS (Gemini + SAPI) | `mark_tts.py` |
+| Local TTS (Coqui + Gemini + SAPI) | `mark_tts.py`, `mark_coqui_tts.py` |
 | UI (Ollama model, voice output, PTT) | `ui.py` |
 | Screen vision + Gemini path | `actions/screen_processor.py` |
 | `screen_find` + desktop tools | `actions/computer_control.py` |

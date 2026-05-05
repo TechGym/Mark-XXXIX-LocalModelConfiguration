@@ -1,4 +1,13 @@
-"""Local speech-to-text for Ollama mode (separate from Ollama chat weights)."""
+"""Local speech-to-text for Ollama mode (separate from Ollama chat weights).
+
+Env tuning (PTT latency):
+
+- ``MARK_WHISPER_DEVICE`` — ``auto`` (default): CUDA if a GPU is visible to ctranslate2,
+  else CPU. Set ``cpu`` or ``cuda`` to force.
+- ``MARK_WHISPER_SIZE`` — ``tiny`` / ``base`` / ``small`` (default) / … Smaller = faster STT.
+- ``MARK_WHISPER_BEAM_SIZE`` — default ``1`` (faster than multi-beam).
+- ``MARK_WHISPER_CPU_THREADS`` — optional integer for CPU decode threads.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +23,29 @@ import numpy as np
 _whisper_model = None
 
 
+def _cuda_device_count() -> int:
+    try:
+        import ctranslate2 as ct2
+
+        fn = getattr(ct2, "get_cuda_device_count", None)
+        if callable(fn):
+            return int(fn())
+    except Exception:
+        pass
+    return 0
+
+
+def _resolve_whisper_device(raw: str) -> str:
+    """
+    ``MARK_WHISPER_DEVICE``: ``cpu`` | ``cuda`` | ``auto`` (default).
+    ``auto`` uses CUDA when ctranslate2 sees a GPU, else CPU.
+    """
+    d = (raw or "").strip().lower()
+    if d in ("cpu", "cuda"):
+        return d
+    return "cuda" if _cuda_device_count() > 0 else "cpu"
+
+
 def _get_whisper():
     """Lazy-load faster-whisper (downloads weights on first use)."""
     global _whisper_model
@@ -24,13 +56,22 @@ def _get_whisper():
     size = (os.environ.get("MARK_WHISPER_SIZE", "") or "small").strip().lower()
     if size not in ("tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3"):
         size = "small"
-    device = (os.environ.get("MARK_WHISPER_DEVICE", "") or "cpu").strip().lower()
-    if device not in ("cpu", "cuda"):
-        device = "cpu"
+    device = _resolve_whisper_device(
+        (os.environ.get("MARK_WHISPER_DEVICE", "") or "auto").strip()
+    )
     compute_type = os.environ.get("MARK_WHISPER_COMPUTE", "").strip() or (
         "int8" if device == "cpu" else "float16"
     )
-    _whisper_model = WhisperModel(size, device=device, compute_type=compute_type)
+    ctor_kw: dict = {}
+    ct = (os.environ.get("MARK_WHISPER_CPU_THREADS", "") or "").strip()
+    if ct.isdigit() and int(ct) > 0:
+        ctor_kw["cpu_threads"] = int(ct)
+    _whisper_model = WhisperModel(
+        size,
+        device=device,
+        compute_type=compute_type,
+        **ctor_kw,
+    )
     print(f"[Voice] 🎙 faster-whisper model={size} device={device} compute={compute_type}")
     return _whisper_model
 
@@ -57,10 +98,15 @@ def transcribe_pcm_int16(pcm: bytes, sample_rate: int, *, language: Optional[str
         x = np.arange(len(audio), dtype=np.float64)
         audio = np.interp(xi, x, audio.astype(np.float64)).astype(np.float32)
 
+    beam_raw = (os.environ.get("MARK_WHISPER_BEAM_SIZE", "") or "1").strip()
+    beam_size = int(beam_raw) if beam_raw.isdigit() else 1
+    beam_size = max(1, min(beam_size, 5))
+
     segments, _info = model.transcribe(
         audio,
         language=lang if lang else None,
         vad_filter=True,
+        beam_size=beam_size,
     )
     parts = [s.text.strip() for s in segments if s.text.strip()]
     return " ".join(parts).strip()

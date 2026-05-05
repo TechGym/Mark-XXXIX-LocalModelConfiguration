@@ -1,11 +1,13 @@
 """
 Text-to-speech for **local Ollama** reply paths.
 
-1. **Gemini TTS** (optional): set ``tts_backend`` to ``gemini`` in ``api_keys.json`` and
-   add ``gemini_api_key``. Uses ``google.genai`` ``generate_content`` with a TTS
-   model; audio plays via **sounddevice** (same PortAudio routing as ``main.py``).
-2. **pyttsx3 / SAPI** (default): Windows installed voices; SAPI uses the **Windows
-   default playback device**.
+1. **Coqui / TechGym TTS** (optional): ``tts_backend`` ``coqui`` — loads your local
+   clone via ``coqui_tts_repo_path``; see ``mark_coqui_tts.py``. On failure, optionally
+   **Gemini TTS** if ``coqui_failover_to_gemini`` is true and a key is set; else **Windows SAPI**.
+2. **Gemini TTS** (optional): ``tts_backend`` ``gemini`` + ``gemini_api_key``;
+   audio via **sounddevice**. On failure, **Windows SAPI**.
+3. **pyttsx3 / SAPI** (``pyttsx3``): Windows installed voices; also the **fallback**
+   for Coqui and Gemini.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ _tls = threading.local()
 # pyttsx3 / SAPI are not safe across thread-pool threads; serialize all TTS.
 _tts_lock = threading.Lock()
 _tts_backend_hint_printed = False
+_gemini_latency_hint_printed = False
 
 
 def _invoke_on_audio_start(cb: Callable[[], None] | None) -> None:
@@ -295,6 +298,30 @@ def _is_gemini_tts_quota_error(exc: BaseException) -> bool:
     )
 
 
+def _is_gemini_tts_transient_or_quota(exc: BaseException) -> bool:
+    """429 / quota plus common overload and gateway errors — try next model or SAPI."""
+    if _is_gemini_tts_quota_error(exc):
+        return True
+    s = str(exc).lower()
+    return any(
+        needle in s
+        for needle in (
+            "503",
+            "502",
+            "500",
+            "unavailable",
+            "overloaded",
+            "timeout",
+            "deadline",
+            "temporarily unavailable",
+            "try again",
+            "connection reset",
+            "connection aborted",
+            "internal error",
+        )
+    )
+
+
 def _try_gemini_tts(
     text: str,
     *,
@@ -339,6 +366,8 @@ def _try_gemini_tts(
 
     response = None
     model_used = primary
+    got: tuple[bytes, str] | None = None
+
     for i, model in enumerate(models_to_try):
         try:
             response = client.models.generate_content(
@@ -356,55 +385,68 @@ def _try_gemini_tts(
                 ),
             )
             model_used = model
-            break
         except Exception as ex:
-            if _is_gemini_tts_quota_error(ex) and i + 1 < len(models_to_try):
+            transient = _is_gemini_tts_transient_or_quota(ex)
+            if transient and i + 1 < len(models_to_try):
                 nxt = models_to_try[i + 1]
+                short = str(ex).strip().replace("\n", " ")[:160]
                 print(
-                    f"[TTS] Gemini TTS model {model!r} is rate-limited or over quota; "
-                    f"retrying {nxt!r}…"
+                    f"[TTS] Gemini TTS model {model!r} failed ({short}); retrying {nxt!r}…"
                 )
                 continue
-            if _is_gemini_tts_quota_error(ex):
+            if transient:
                 print(
-                    "[TTS] Gemini TTS: quota or rate limit (429 / RESOURCE_EXHAUSTED). "
-                    "Free tier has low per-model limits — you will hear Windows SAPI until "
-                    "quota resets or billing is enabled. "
+                    "[TTS] Gemini TTS: all listed cloud models failed (quota / overload / "
+                    "gateway). Falling back to Windows SAPI. "
                     "https://ai.google.dev/gemini-api/docs/rate-limits"
                 )
             else:
                 print(f"[TTS] Gemini TTS request failed: {ex}")
             return False
 
-    if response is None:
-        return False
+        got = _gemini_extract_audio(response)
+        if got:
+            break
 
-    got = _gemini_extract_audio(response)
-    if not got:
         cands = getattr(response, "candidates", None) or []
+        fr = None
+        if cands:
+            fr = getattr(cands[0], "finish_reason", None)
+        if i + 1 < len(models_to_try):
+            nxt = models_to_try[i + 1]
+            print(
+                f"[TTS] Gemini TTS model {model!r} returned no usable audio "
+                f"(finish_reason={fr!r}); retrying {nxt!r}…"
+            )
+            continue
+
         if not cands:
             print("[TTS] Gemini TTS: empty candidates (prompt blocked or model error).")
         else:
-            c0 = cands[0]
-            fr = getattr(c0, "finish_reason", None)
             print(
                 f"[TTS] Gemini TTS returned no audio parts "
                 f"(finish_reason={fr!r}). Check model id ``{model_used}`` and API quotas."
             )
         return False
+
+    if response is None or not got:
+        return False
     data, mime = got
     try:
-        _invoke_on_audio_start(on_audio_start)
-        if "wav" in mime or data[:4] == b"RIFF":
-            _play_wav_bytes_riff(data)
-        else:
-            # Default PCM from Gemini TTS docs: 24 kHz mono int16
-            rate = 24000
-            if "24000" in mime:
+        # Serialize PortAudio / SAPI with pyttsx3; do not hold this lock during HTTP above
+        # (avoids vision thread blocking forever behind chat TTS, and vice versa).
+        with _tts_lock:
+            _invoke_on_audio_start(on_audio_start)
+            if "wav" in mime or data[:4] == b"RIFF":
+                _play_wav_bytes_riff(data)
+            else:
+                # Default PCM from Gemini TTS docs: 24 kHz mono int16
                 rate = 24000
-            elif "48000" in mime:
-                rate = 48000
-            _play_pcm_int16_mono(data, rate)
+                if "24000" in mime:
+                    rate = 24000
+                elif "48000" in mime:
+                    rate = 48000
+                _play_pcm_int16_mono(data, rate)
     except Exception as ex:
         print(f"[TTS] Gemini audio playback failed: {ex}")
         return False
@@ -430,34 +472,100 @@ def speak_mark_tts(
     on_audio_start: Callable[[], None] | None = None,
 ) -> None:
     """
-    Local Jarvis speech: **Gemini TTS** when ``tts_backend`` is ``gemini`` and a
-    ``gemini_api_key`` is set; otherwise **pyttsx3**.
+    Local Jarvis speech (Ollama path): **Coqui** (``tts_backend: coqui``), **Gemini TTS**
+    (``gemini`` + API key), or **Windows SAPI** (``pyttsx3``). Coqui and Gemini failures
+    always fall back to **pyttsx3** so you still hear output while tuning local TTS.
 
     ``on_audio_start`` runs on the TTS thread **immediately before** PortAudio /
     SAPI begins playback — use it to sync the SPEAKING HUD with audible output
     (Gemini otherwise spends seconds in HTTP synthesis first).
+
+    **Coqui + cloud:** When ``tts_backend`` is ``coqui``, Gemini TTS runs after a
+    Coqui miss only if ``coqui_failover_to_gemini`` is true (UI checkbox or JSON)
+    **and** ``gemini_api_key`` is set — you choose the chain; keys are not implied.
     """
     if not (text or "").strip():
         return
-    global _tts_backend_hint_printed
-    with _tts_lock:
-        from mark_llm_settings import get_gemini_api_key, get_local_tts_backend
+    global _tts_backend_hint_printed, _gemini_latency_hint_printed
+    from mark_llm_settings import (
+        get_coqui_failover_to_gemini,
+        get_gemini_api_key,
+        get_local_tts_backend,
+    )
 
+    with _tts_lock:
         if (
             not _tts_backend_hint_printed
-            and get_local_tts_backend() != "gemini"
+            and get_local_tts_backend() == "pyttsx3"
             and get_gemini_api_key()
         ):
             print(
-                "[TTS] You have gemini_api_key but tts_backend is not \"gemini\" — "
-                "replies use Windows SAPI (e.g. Zira). In the UI under VOICE OUTPUT "
+                "[TTS] You have gemini_api_key but tts_backend is \"pyttsx3\" (Windows SAPI) — "
+                "replies use Zira (or your SAPI pick). In the UI under VOICE OUTPUT "
                 "(LOCAL), choose \"Gemini neural (uses API key)\", or set "
                 "\"tts_backend\": \"gemini\" in config/api_keys.json."
             )
             _tts_backend_hint_printed = True
-        if _try_gemini_tts(text, on_audio_start=on_audio_start):
+
+    backend = get_local_tts_backend()
+
+    if backend == "coqui":
+        from mark_coqui_tts import try_speak_coqui
+
+        if try_speak_coqui(text, on_audio_start=on_audio_start, tts_lock=_tts_lock):
             return
-        if get_local_tts_backend() == "gemini":
+        if get_coqui_failover_to_gemini() and get_gemini_api_key():
+            print(
+                "[TTS] Coqui did not speak — trying Gemini TTS (``coqui_failover_to_gemini`` on)."
+            )
+            if _try_gemini_tts(text, on_audio_start=on_audio_start):
+                with _tts_lock:
+                    if not _gemini_latency_hint_printed:
+                        print(
+                            "[TTS] Latency: Gemini TTS calls the cloud for every reply (often 1–4s). "
+                            "For fastest local speech set \"tts_backend\": \"sapi\" in api_keys.json "
+                            "or env MARK_TTS_BACKEND=sapi (Windows SAPI / pyttsx3)."
+                        )
+                        _gemini_latency_hint_printed = True
+                return
+
+    # Gemini HTTP runs without holding _tts_lock so vision + chat threads do not deadlock.
+    if backend == "gemini" and get_gemini_api_key():
+        if _try_gemini_tts(text, on_audio_start=on_audio_start):
+            with _tts_lock:
+                if not _gemini_latency_hint_printed:
+                    print(
+                        "[TTS] Latency: Gemini TTS calls the cloud for every reply (often 1–4s). "
+                        "For fastest local speech set \"tts_backend\": \"sapi\" in api_keys.json "
+                        "or env MARK_TTS_BACKEND=sapi (Windows SAPI / pyttsx3)."
+                    )
+                    _gemini_latency_hint_printed = True
+            return
+
+    with _tts_lock:
+        if backend == "coqui":
+            fo = get_coqui_failover_to_gemini()
+            key = bool(get_gemini_api_key())
+            if fo and key:
+                tail = " Coqui and Gemini TTS both failed — using Windows SAPI."
+            elif fo and not key:
+                tail = (
+                    " Failover to Gemini is on but there is no ``gemini_api_key`` — "
+                    "using Windows SAPI."
+                )
+            elif not fo and key:
+                tail = (
+                    " Gemini failover is off (``coqui_failover_to_gemini``: false) — "
+                    "using Windows SAPI."
+                )
+            else:
+                tail = " No Gemini key and failover off — using Windows SAPI."
+            print(
+                "[TTS] Coqui unavailable for this reply."
+                + tail
+                + " (If load failed, the checklist block above lists what to fix.)"
+            )
+        elif backend == "gemini":
             print(
                 "[TTS] Gemini TTS failed or returned no usable audio — "
                 "falling back to Windows SAPI (e.g. Zira). See [TTS] lines above."

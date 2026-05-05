@@ -23,7 +23,7 @@ from PyQt6.QtGui import (
     QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy,
     QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
@@ -1469,8 +1469,63 @@ class MainWindow(QMainWindow):
         """)
         self._tts_backend_combo.addItem("Windows (SAPI / pyttsx3)", "pyttsx3")
         self._tts_backend_combo.addItem("Gemini neural (uses API key)", "gemini")
+        self._tts_backend_combo.addItem("Coqui local (TechGym TTS repo)", "coqui")
         self._tts_backend_combo.currentIndexChanged.connect(self._on_tts_backend_changed)
         tts_lay.addWidget(self._tts_backend_combo)
+        self._coqui_cfg_wrap = QWidget()
+        cq_lay = QVBoxLayout(self._coqui_cfg_wrap)
+        cq_lay.setContentsMargins(0, 0, 0, 0)
+        cq_lay.setSpacing(2)
+        rl = QLabel("Coqui clone root (folder with TTS/)")
+        rl.setFont(QFont("Courier New", 7))
+        rl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        cq_lay.addWidget(rl)
+        self._coqui_repo_edit = QLineEdit()
+        self._coqui_repo_edit.setPlaceholderText(
+            r"C:\path\to\TechGym-TTS-scout"
+        )
+        self._coqui_repo_edit.setFont(QFont("Courier New", 7))
+        self._coqui_repo_edit.setMinimumHeight(24)
+        self._coqui_repo_edit.setStyleSheet(
+            f"background: #000d12; color: {C.TEXT}; border: 1px solid {C.BORDER}; "
+            f"border-radius: 3px; padding: 2px 6px;"
+        )
+        self._coqui_repo_edit.editingFinished.connect(self._persist_tts_settings)
+        cq_lay.addWidget(self._coqui_repo_edit)
+        ml = QLabel("Coqui model (registry — pick a preset or type your own)")
+        ml.setFont(QFont("Courier New", 7))
+        ml.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        cq_lay.addWidget(ml)
+        self._coqui_model_combo = QComboBox()
+        self._coqui_model_combo.setEditable(True)
+        self._coqui_model_combo.setFont(QFont("Courier New", 7))
+        self._coqui_model_combo.setMinimumHeight(28)
+        self._coqui_model_combo.setStyleSheet(self._tts_backend_combo.styleSheet())
+        self._coqui_model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        try:
+            from mark_llm_settings import list_coqui_tts_model_presets
+
+            for mid in list_coqui_tts_model_presets():
+                self._coqui_model_combo.addItem(mid)
+        except Exception:
+            self._coqui_model_combo.addItem("tts_models/en/ljspeech/tacotron2-DDC")
+        _cm_le = self._coqui_model_combo.lineEdit()
+        if _cm_le is not None:
+            _cm_le.setPlaceholderText("tts_models/en/…")
+            _cm_le.editingFinished.connect(self._persist_tts_settings)
+        self._coqui_model_combo.activated.connect(self._on_coqui_model_combo_activated)
+        cq_lay.addWidget(self._coqui_model_combo)
+        tts_lay.addWidget(self._coqui_cfg_wrap)
+        self._coqui_cfg_wrap.setVisible(False)
+        self._coqui_gemini_failover_chk = QCheckBox(
+            "If Coqui fails, try Gemini TTS (uses gemini_api_key)"
+        )
+        self._coqui_gemini_failover_chk.setFont(QFont("Courier New", 7))
+        self._coqui_gemini_failover_chk.setStyleSheet(
+            f"color: {C.TEXT_MED}; background: transparent;"
+        )
+        self._coqui_gemini_failover_chk.toggled.connect(self._on_coqui_failover_toggled)
+        tts_lay.addWidget(self._coqui_gemini_failover_chk)
         self._tts_gemini_voice_lbl = QLabel("Gemini voice")
         self._tts_gemini_voice_lbl.setFont(QFont("Courier New", 7))
         self._tts_gemini_voice_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
@@ -1686,28 +1741,31 @@ class MainWindow(QMainWindow):
 
     def _on_setup_done(self, key: str, os_name: str, use_ollama: bool):
         os.makedirs(CONFIG_DIR, exist_ok=True)
+        data: dict = {}
+        if API_FILE.exists():
+            try:
+                data = json.loads(API_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
         if use_ollama:
             o_url = "http://127.0.0.1:11434"
             o_model = "llama3.1:8b"
             if self._overlay:
                 o_url = (self._overlay._ollama_url.text().strip() or o_url)
                 o_model = (self._overlay._ollama_model.text().strip() or o_model)
-            cfg = {
-                "llm_provider": "ollama",
-                "ollama_url": o_url,
-                "ollama_model": o_model,
-                "gemini_api_key": "",
-                "os_system": os_name,
-            }
+            data["llm_provider"] = "ollama"
+            data["ollama_url"] = o_url
+            data["ollama_model"] = o_model
+            data["os_system"] = os_name
+            if (key or "").strip():
+                data["gemini_api_key"] = (key or "").strip()
             log_extra = f"LOCAL_OLLAMA model={o_model}"
         else:
-            cfg = {
-                "llm_provider": "gemini",
-                "gemini_api_key": key,
-                "os_system": os_name,
-            }
+            data["llm_provider"] = "gemini"
+            data["gemini_api_key"] = (key or "").strip()
+            data["os_system"] = os_name
             log_extra = "GEMINI_CLOUD"
-        API_FILE.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+        API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
         self._ready = True
         if self._overlay:
             self._overlay.hide()
@@ -1791,9 +1849,27 @@ class MainWindow(QMainWindow):
             return
         self._log.append_log(f"SYS: Ollama model → {model}")
 
+    def _current_tts_backend_id(self) -> str:
+        d = self._tts_backend_combo.currentData()
+        if isinstance(d, str) and d.strip():
+            return d.strip()
+        return "pyttsx3"
+
+    def _set_tts_backend_combo_by_id(self, backend_id: str) -> None:
+        want = (backend_id or "pyttsx3").strip().lower()
+        for i in range(self._tts_backend_combo.count()):
+            d = self._tts_backend_combo.itemData(i)
+            if isinstance(d, str) and d.strip().lower() == want:
+                self._tts_backend_combo.setCurrentIndex(i)
+                return
+        self._tts_backend_combo.setCurrentIndex(0)
+
     def _try_show_ollama_tts_controls(self) -> None:
         try:
             from mark_llm_settings import (
+                get_coqui_failover_to_gemini,
+                get_coqui_model_name,
+                get_coqui_tts_repo_path,
                 get_gemini_api_key,
                 get_gemini_live_voice_name,
                 get_local_tts_backend,
@@ -1810,8 +1886,14 @@ class MainWindow(QMainWindow):
         self._tts_backend_wrap.setVisible(True)
         self._tts_backend_combo.blockSignals(True)
         self._gemini_voice_combo.blockSignals(True)
+        self._coqui_gemini_failover_chk.blockSignals(True)
+        self._coqui_repo_edit.blockSignals(True)
+        self._coqui_model_combo.blockSignals(True)
         backend = get_local_tts_backend()
-        self._tts_backend_combo.setCurrentIndex(1 if backend == "gemini" else 0)
+        self._set_tts_backend_combo_by_id(backend)
+        self._coqui_repo_edit.setText(get_coqui_tts_repo_path() or "")
+        self._coqui_model_combo.setCurrentText(get_coqui_model_name() or "")
+        self._coqui_gemini_failover_chk.setChecked(get_coqui_failover_to_gemini())
         self._gemini_voice_combo.clear()
         for name in list_gemini_tts_voice_names():
             self._gemini_voice_combo.addItem(name)
@@ -1823,6 +1905,9 @@ class MainWindow(QMainWindow):
             self._gemini_voice_combo.setCurrentIndex(0)
         self._tts_backend_combo.blockSignals(False)
         self._gemini_voice_combo.blockSignals(False)
+        self._coqui_gemini_failover_chk.blockSignals(False)
+        self._coqui_repo_edit.blockSignals(False)
+        self._coqui_model_combo.blockSignals(False)
         self._update_tts_widgets_enabled(get_gemini_api_key())
         env_tb = os.environ.get("MARK_TTS_BACKEND", "").strip()
         base = (
@@ -1843,9 +1928,20 @@ class MainWindow(QMainWindow):
         except ImportError:
             return
         key = gemini_key if gemini_key is not None else get_gemini_api_key()
-        use_gem = self._tts_backend_combo.currentIndex() == 1
+        bid = self._current_tts_backend_id()
+        use_gem = bid == "gemini"
         self._gemini_voice_combo.setEnabled(use_gem)
         self._tts_gemini_voice_lbl.setEnabled(use_gem)
+        self._gemini_voice_combo.setVisible(use_gem)
+        self._tts_gemini_voice_lbl.setVisible(use_gem)
+        if hasattr(self, "_coqui_gemini_failover_chk"):
+            self._coqui_gemini_failover_chk.setEnabled(bid == "coqui")
+        if hasattr(self, "_coqui_cfg_wrap"):
+            self._coqui_cfg_wrap.setVisible(bid == "coqui")
+            if hasattr(self, "_coqui_repo_edit"):
+                self._coqui_repo_edit.setEnabled(bid == "coqui")
+            if hasattr(self, "_coqui_model_combo"):
+                self._coqui_model_combo.setEnabled(bid == "coqui")
         if use_gem:
             self._tts_gemini_hint.setText(
                 (
@@ -1855,6 +1951,12 @@ class MainWindow(QMainWindow):
                 )
                 if key
                 else "Set ``gemini_api_key`` in api_keys.json (same as full Gemini mode)."
+            )
+        elif bid == "coqui":
+            self._tts_gemini_hint.setText(
+                "Coqui uses **registry model ids** (dropdown presets), not Gemini voice names. "
+                "Clone root + model save to api_keys.json. Same venv: ``pip install -e`` your TTS repo. "
+                "Tortoise disabled. Gemini-after-Coqui: checkbox."
             )
         else:
             self._tts_gemini_hint.setText(
@@ -1867,7 +1969,25 @@ class MainWindow(QMainWindow):
             )
 
     def _on_tts_backend_changed(self, _idx: int) -> None:
+        if self._current_tts_backend_id() == "coqui" and hasattr(self, "_coqui_repo_edit"):
+            try:
+                from mark_llm_settings import get_coqui_model_name, get_coqui_tts_repo_path
+
+                self._coqui_repo_edit.blockSignals(True)
+                self._coqui_model_combo.blockSignals(True)
+                self._coqui_repo_edit.setText(get_coqui_tts_repo_path() or "")
+                self._coqui_model_combo.setCurrentText(get_coqui_model_name() or "")
+                self._coqui_repo_edit.blockSignals(False)
+                self._coqui_model_combo.blockSignals(False)
+            except Exception:
+                pass
         self._update_tts_widgets_enabled()
+        self._persist_tts_settings()
+
+    def _on_coqui_failover_toggled(self, _checked: bool) -> None:
+        self._persist_tts_settings()
+
+    def _on_coqui_model_combo_activated(self, _index: int) -> None:
         self._persist_tts_settings()
 
     def _on_gemini_voice_changed(self, _text: str) -> None:
@@ -1878,9 +1998,9 @@ class MainWindow(QMainWindow):
         except ImportError:
             self._persist_tts_settings()
             return
-        if get_gemini_api_key() and self._tts_backend_combo.currentIndex() == 0:
+        if get_gemini_api_key() and self._current_tts_backend_id() == "pyttsx3":
             self._tts_backend_combo.blockSignals(True)
-            self._tts_backend_combo.setCurrentIndex(1)
+            self._set_tts_backend_combo_by_id("gemini")
             self._tts_backend_combo.blockSignals(False)
             self._update_tts_widgets_enabled(get_gemini_api_key())
         self._persist_tts_settings()
@@ -1892,17 +2012,43 @@ class MainWindow(QMainWindow):
             data = json.loads(API_FILE.read_text(encoding="utf-8"))
         except Exception:
             return
-        data["tts_backend"] = (
-            "gemini" if self._tts_backend_combo.currentIndex() == 1 else "pyttsx3"
-        )
+        data["tts_backend"] = self._current_tts_backend_id()
         v = (self._gemini_voice_combo.currentText() or "").strip()
         if v:
             data["gemini_live_voice"] = v
+        if hasattr(self, "_coqui_gemini_failover_chk"):
+            data["coqui_failover_to_gemini"] = bool(
+                self._coqui_gemini_failover_chk.isChecked()
+            )
+        # Coqui fields: only overwrite when non-empty. Empty QLineEdits must NOT wipe
+        # api_keys.json (e.g. failover toggle or Gemini voice save runs before edits hydrate).
+        if self._current_tts_backend_id() == "coqui" and hasattr(self, "_coqui_repo_edit"):
+            rp = (self._coqui_repo_edit.text() or "").strip()
+            mn = (self._coqui_model_combo.currentText() or "").strip()
+            if rp:
+                data["coqui_tts_repo_path"] = rp
+            if mn:
+                data["coqui_model_name"] = mn
         try:
             API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
         except OSError:
             return
-        extra = f", Gemini voice={v}" if data["tts_backend"] == "gemini" else ""
+        if self._current_tts_backend_id() == "coqui":
+            try:
+                from mark_coqui_tts import reset_coqui_engine_cache
+
+                reset_coqui_engine_cache()
+            except Exception:
+                pass
+        if data["tts_backend"] == "gemini":
+            extra = f", Gemini voice={v}"
+        elif data["tts_backend"] == "coqui":
+            fo = bool(data.get("coqui_failover_to_gemini"))
+            extra = (
+                f" (Coqui; Gemini failover={'on' if fo else 'off'}; then SAPI if needed)"
+            )
+        else:
+            extra = ""
         self._log.append_log(f"SYS: Voice output → {data['tts_backend']}{extra}")
 
 

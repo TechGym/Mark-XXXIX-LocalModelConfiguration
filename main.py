@@ -289,16 +289,25 @@ TOOL_DECLARATIONS = [
     {
         "name": "screen_process",
         "description": (
-            "Captures and analyzes the screen or webcam image. "
-            "MUST be called when user asks what is on screen, what you see, "
-            "analyze my screen, look at camera, etc. "
-            "You have NO visual ability without this tool. "
-            "After calling this tool, stay SILENT — the vision module speaks directly."
+            "Captures the monitor or **webcam** and runs vision. You have NO eyes without this tool. "
+            "Use ``angle: \"screen\"`` for what's on the **monitor** (windows, browser pixels). "
+            "Use ``angle: \"camera\"`` for **physical** questions: what they **hold**, **in front of "
+            "them**, **in my hand**, **on my desk** (object), or \"what do I have here\" toward "
+            "the webcam — NOT for reading a web page (use browser_control get_text). "
+            "Do NOT ask the user to describe the screen instead of calling this tool. "
+            "After calling, stay SILENT — the vision module speaks directly."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "angle": {"type": "STRING", "description": "'screen' to capture display, 'camera' for webcam. Default: 'screen'"},
+                "angle": {
+                    "type": "STRING",
+                    "description": (
+                        "'screen' = desktop capture; 'camera' = webcam for hands/objects "
+                        "in front of the user. Default 'screen' — use 'camera' for holding / "
+                        "in front of me / in my hand."
+                    )
+                },
                 "text":  {"type": "STRING", "description": "The question or instruction about the captured image"}
             },
             "required": ["text"]
