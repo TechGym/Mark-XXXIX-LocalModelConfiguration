@@ -96,6 +96,20 @@ def user_text_is_in_character_greeting_only(user_text: str | None) -> bool:
     return any(re.search(p, tl) for p in patterns)
 
 
+def user_text_explicitly_requests_real_message(user_text: str | None) -> bool:
+    """
+    Require clear outbound intent before allowing ``send_message`` execution.
+    """
+    if not user_text:
+        return False
+    u = user_text.strip()
+    if not u:
+        return False
+    if user_text_is_in_character_greeting_only(u):
+        return False
+    return user_text_implies_external_messaging(u)
+
+
 async def run_jarvis_tool(
     name: str,
     args: dict,
@@ -165,18 +179,16 @@ async def run_jarvis_tool(
 
         elif name == "send_message":
             uq = (user_query or "").strip() if user_query else ""
-            if uq and user_text_is_in_character_greeting_only(uq):
+            if uq and not user_text_explicitly_requests_real_message(uq):
                 result = (
-                    "SKIPPED — Host policy: this looked like a spoken/in-character greeting "
-                    "(e.g. \"say hi to Cayden\"), not a request to open WhatsApp or send a real "
-                    "message. Do **not** claim a message was sent. Reply only with the greeting "
-                    "you would say aloud to that person."
+                    "SKIPPED — Host policy: outbound messaging was blocked because your request "
+                    "did not explicitly ask to send/text/message/email."
                 )
                 if hasattr(ui, "write_log"):
                     ui.write_log(
-                        "SYS: send_message skipped — greeting-only (use voice, not WhatsApp)."
+                        "SYS: send_message skipped — explicit outbound intent required."
                     )
-                print("[JARVIS] send_message skipped (in-character greeting only).")
+                print("[JARVIS] send_message skipped (explicit outbound intent missing).")
             else:
                 r = await loop.run_in_executor(
                     None,
@@ -629,10 +641,23 @@ def refine_web_search_args(user_text: str, args: dict) -> dict:
     if not isinstance(args, dict):
         return args
     mode = (args.get("mode") or "").strip().lower()
-    if mode in ("fetch", "news"):
+    if mode == "fetch":
         return args
-    raw_q = (args.get("query") or "").strip()
     u = scrub_affirmative_lead((user_text or "").strip())
+    raw_q = (args.get("query") or "").strip()
+    # If the model emitted ``web_search`` with no query, fall back to the user's words.
+    if not raw_q and u:
+        raw_q = u
+        args = {**args, "query": raw_q}
+    # News mode should still be normalized to a concrete broad query when vague.
+    if mode == "news":
+        q_news = compact_vague_news_web_query(raw_q, u or raw_q)
+        if u:
+            q_news = apply_site_operator_from_user_request(u, q_news)
+        if q_news != raw_q:
+            print(f"[JARVIS] web_search(news) query refined: {raw_q!r} -> {q_news!r}")
+            return {**args, "query": q_news}
+        return args
     ctx = u or raw_q
     q = scrub_affirmative_lead(raw_q)
     if u:

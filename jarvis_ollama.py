@@ -25,6 +25,7 @@ from jarvis_tool_runner import (
     refine_web_search_args,
     run_jarvis_tool,
     synthetic_tool_calls_from_text,
+    user_text_explicitly_requests_real_message,
 )
 from memory.memory_manager import (
     assistant_persona_final_override,
@@ -126,6 +127,31 @@ def _ollama_tool_names(tools: list[dict] | None) -> set[str]:
         if isinstance(n, str) and n.strip():
             names.add(n.strip())
     return names
+
+
+def _split_for_progressive_speech(text: str, *, max_chunk_chars: int = 260) -> list[str]:
+    """
+    Split long replies into sentence-like chunks so TTS starts earlier.
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+    parts = re.findall(r"[^.!?\n]+[.!?]?|\S+", t)
+    out: list[str] = []
+    cur = ""
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        cand = f"{cur} {p}".strip() if cur else p
+        if cur and len(cand) > max_chunk_chars:
+            out.append(cur.strip())
+            cur = p
+        else:
+            cur = cand
+    if cur.strip():
+        out.append(cur.strip())
+    return out
 
 
 def _user_means_read_browser_page(user_text: str) -> bool:
@@ -435,6 +461,19 @@ class JarvisOllama:
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
 
+    async def _speak_progressive(self, text: str) -> None:
+        """
+        Speak in smaller chunks so audio starts earlier for long replies.
+        """
+        chunks = _split_for_progressive_speech(text)
+        if not chunks:
+            return
+        if len(chunks) == 1:
+            await self._speak_async(chunks[0])
+            return
+        for chunk in chunks:
+            await self._speak_async(chunk)
+
     def _wire_text_input(self) -> None:
         assert self._loop and self._user_queue
 
@@ -592,6 +631,19 @@ class JarvisOllama:
                 tool_calls = _ensure_camera_angle_for_hands_questions(
                     user_text, tool_calls
                 )
+                if not user_text_explicitly_requests_real_message(user_text):
+                    before = len(tool_calls)
+                    tool_calls = [
+                        tc
+                        for tc in tool_calls
+                        if ((tc.get("function") or {}).get("name") or "").strip()
+                        != "send_message"
+                    ]
+                    if len(tool_calls) != before:
+                        self.ui.write_log(
+                            "SYS: Ignored send_message tool call — explicit outbound "
+                            "messaging intent not found in user request."
+                        )
 
             assistant_msg: dict = {"role": "assistant", "content": content}
             if tool_calls:
@@ -648,11 +700,11 @@ class JarvisOllama:
 
             if content:
                 self.ui.write_log(f"Jarvis: {content}")
-                await self._speak_async(content)
+                await self._speak_progressive(content)
             return
 
         self.ui.write_log("Jarvis: (no response after tool rounds)")
-        await self._speak_async("Sir, I hit an internal reasoning limit on that request.")
+        await self._speak_progressive("Sir, I hit an internal reasoning limit on that request.")
 
     async def run(self) -> None:
         self._loop = asyncio.get_event_loop()
