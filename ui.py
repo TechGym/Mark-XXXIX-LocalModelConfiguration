@@ -2009,9 +2009,18 @@ class MainWindow(QMainWindow):
         if not API_FILE.exists():
             return
         try:
+            from mark_llm_settings import coqui_engine_disk_signature
+        except ImportError:
+            coqui_engine_disk_signature = None  # type: ignore[misc, assignment]
+        try:
             data = json.loads(API_FILE.read_text(encoding="utf-8"))
         except Exception:
             return
+        prev_coqui_sig = (
+            coqui_engine_disk_signature(dict(data))
+            if coqui_engine_disk_signature is not None
+            else ""
+        )
         data["tts_backend"] = self._current_tts_backend_id()
         v = (self._gemini_voice_combo.currentText() or "").strip()
         if v:
@@ -2029,11 +2038,17 @@ class MainWindow(QMainWindow):
                 data["coqui_tts_repo_path"] = rp
             if mn:
                 data["coqui_model_name"] = mn
+        new_coqui_sig = (
+            coqui_engine_disk_signature(data)
+            if coqui_engine_disk_signature is not None
+            else ""
+        )
         try:
             API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
         except OSError:
             return
-        if self._current_tts_backend_id() == "coqui":
+        tb = (data.get("tts_backend") or "").strip().lower()
+        if tb in ("coqui", "techgym") and new_coqui_sig != prev_coqui_sig:
             try:
                 from mark_coqui_tts import reset_coqui_engine_cache
 

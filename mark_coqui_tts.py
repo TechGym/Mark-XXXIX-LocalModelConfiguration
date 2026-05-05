@@ -195,6 +195,25 @@ def _print_coqui_goal_checklist(
         print(f"  • {ln}")
 
 
+def preload_coqui_engine() -> None:
+    """
+    Load the Coqui model once (background thread). Call when local Ollama attaches so the
+    first spoken reply does not pay full model init on the critical path.
+
+    No-op when ``tts_backend`` is not ``coqui`` or init fails (same as first ``tts()``).
+    """
+    try:
+        from mark_llm_settings import get_local_tts_backend
+
+        if get_local_tts_backend() != "coqui":
+            return
+    except Exception:
+        return
+    eng = _get_engine()
+    if eng is not None:
+        print("[TTS] Coqui: model cached for this session (preload OK).")
+
+
 def reset_coqui_engine_cache() -> None:
     """
     Drop cached Coqui engine (e.g. after editing ``api_keys.json``).

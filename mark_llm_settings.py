@@ -391,6 +391,40 @@ def get_coqui_language() -> str:
     )
 
 
+def coqui_engine_disk_signature(data: dict | None) -> str:
+    """
+    Stable fingerprint of **on-disk** Coqui settings from ``api_keys.json`` (or a dict
+    about to be written). Used to avoid dropping the cached Coqui engine when the UI
+    re-saves identical Coqui fields (e.g. ``editingFinished`` without real changes).
+    """
+    if not isinstance(data, dict):
+        return ""
+    tb = (data.get("tts_backend") or "").strip().lower()
+    if tb not in ("coqui", "techgym"):
+        return ""
+    keys = (
+        "coqui_tts_repo_path",
+        "coqui_model_name",
+        "coqui_model_path",
+        "coqui_config_path",
+        "coqui_vocoder_path",
+        "coqui_vocoder_config_path",
+        "coqui_use_cuda",
+        "coqui_speaker",
+        "coqui_language",
+    )
+    parts: list[str] = []
+    for k in keys:
+        v = data.get(k)
+        if isinstance(v, bool):
+            parts.append("1" if v else "0")
+        elif v is None:
+            parts.append("")
+        else:
+            parts.append(str(v).strip())
+    return "\x1e".join(parts)
+
+
 def get_coqui_failover_to_gemini() -> bool:
     """
     When ``tts_backend`` is ``coqui``, if True and ``gemini_api_key`` is set,

@@ -117,22 +117,144 @@ def update_memory(memory_update: dict) -> dict:
         print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
     return memory
 
+
+def _memory_entry_str(entry: object) -> str:
+    if entry is None:
+        return ""
+    if isinstance(entry, dict):
+        v = entry.get("value")
+        if v is None:
+            return ""
+        return str(v).strip()
+    return str(entry).strip()
+
+
+def _registered_names_prompt(*, assistant: str, human_first: str) -> str:
+    """
+    Explicit A/B mapping. Avoid instruction text like "your name" — models often bind
+    "you" to the wrong role when a human name appears nearby.
+    """
+    lines = [
+        "[REGISTERED NAMES — fixed mapping; never swap A and B]",
+        f"A) **Assistant** (the AI chatbot the human talks to): «{assistant}»",
+    ]
+    if human_first:
+        lines.append(
+            f"B) **Human user** (the living person at keyboard/mic): «{human_first}»"
+        )
+        lines.append("")
+        lines.append("Route the user's question by who the question is about:")
+        lines.append(
+            f'• Question is about **the assistant** (second person toward the bot), e.g. '
+            f'"What is your name?" meaning the bot → answer using **only** «{assistant}». '
+            f'**Incorrect:** naming «{human_first}» as the bot.'
+        )
+        lines.append(
+            f'• Question is about **the human themselves** (first person), e.g. '
+            f'"What is my name?" → answer using **only** «{human_first}» for that person '
+            f'(e.g. "Your name is {human_first}"). **Incorrect:** naming «{assistant}» here, '
+            f'or saying the assistant\'s name is «{human_first}».'
+        )
+    else:
+        lines.append("")
+        lines.append(
+            f'• User asks the bot\'s name → use **only** «{assistant}».'
+        )
+    lines.append("")
+    lines.append(
+        "Assistant **grammar**: In normal replies refer to yourself with **first person** "
+        "(I, me, my) — not third person (she, her, herself). Do not write as if the assistant "
+        f'were a separate person (avoid "{assistant} can …" and "She can …"; say "I can …"). '
+        f'Use «{assistant}» when giving your name or when a name is explicitly required; otherwise prefer **I**.'
+    )
+    return "\n".join(lines) + "\n"
+
+
+def assistant_persona_final_override(memory: dict | None) -> str:
+    """
+    Short system suffix so the chosen assistant display name wins over JARVIS
+    branding in ``core/prompt.txt`` (small models often revert on follow-up questions).
+    """
+    if not memory or not isinstance(memory, dict):
+        return ""
+    identity = memory.get("identity")
+    if not isinstance(identity, dict):
+        return ""
+    assistant = _memory_entry_str(identity.get("assistant_name"))
+    if not assistant:
+        return ""
+    human = _memory_entry_str(identity.get("name"))
+    body = _registered_names_prompt(assistant=assistant, human_first=human)
+    if human:
+        tail = (
+            "\n[FINAL — SAME NAME RULES]\n"
+            "If any other text conflicts, **A) is the assistant** and **B) is the human** as above. "
+            "JARVIS in protocol headers is product branding, not a replacement for A). "
+            "About yourself speak **I/me/my**, never **she/her** for the assistant."
+        )
+    else:
+        tail = (
+            "\n[FINAL — SAME NAME RULES]\n"
+            "If any other text conflicts, use **A)** as the assistant name above. "
+            "JARVIS in protocol headers is product branding, not a replacement for A). "
+            "About yourself speak **I/me/my**, never **she/her** for the assistant."
+        )
+    return "\n" + body + tail
+
+
 def format_memory_for_prompt(memory: dict | None) -> str:
     if not memory:
         return ""
 
-    lines = []
+    identity = memory.get("identity", {})
+    if not isinstance(identity, dict):
+        identity = {}
 
-    identity  = memory.get("identity", {})
-    id_fields = ["name", "age", "birthday", "city", "job", "language", "school", "nationality"]
+    assistant = _memory_entry_str(identity.get("assistant_name"))
+    skip_identity = frozenset({"assistant_name"})
+    id_fields = [
+        "name",
+        "age",
+        "birthday",
+        "city",
+        "job",
+        "language",
+        "school",
+        "nationality",
+    ]
+
+    human_nm = _memory_entry_str(identity.get("name"))
+
+    chunks: list[str] = []
+    if assistant:
+        chunks.append(_registered_names_prompt(assistant=assistant, human_first=human_nm))
+        chunks.append(
+            "[ASSISTANT VOICE / PRODUCT]\n"
+            f"The assistant introduces as «{assistant}». "
+            "JARVIS in protocol titles is product branding, not a second assistant name.\n"
+        )
+
+    lines: list[str] = []
+    skip_human_name_line = bool(assistant and human_nm)
     for field in id_fields:
+        if field in skip_identity:
+            continue
         entry = identity.get(field)
-        if entry:
-            val = entry.get("value") if isinstance(entry, dict) else entry
-            if val:
-                lines.append(f"{field.title()}: {val}")
+        if not entry:
+            continue
+        val = entry.get("value") if isinstance(entry, dict) else entry
+        if not val:
+            continue
+        if field == "name":
+            if skip_human_name_line:
+                continue
+            lines.append(
+                f"Human user's name (for \"my name\" / self questions only): {val}"
+            )
+        else:
+            lines.append(f"{field.title()}: {val}")
     for key, entry in identity.items():
-        if key in id_fields:
+        if key in id_fields or key in skip_identity:
             continue
         val = entry.get("value") if isinstance(entry, dict) else entry
         if val:
@@ -183,11 +305,16 @@ def format_memory_for_prompt(memory: dict | None) -> str:
             if val:
                 lines.append(f"  - {key}: {val}")
 
-    if not lines:
+    if lines:
+        chunks.append(
+            "[WHAT YOU KNOW ABOUT THE HUMAN USER — use naturally, never recite like a list]\n"
+            + "\n".join(lines)
+        )
+
+    if not chunks:
         return ""
 
-    header = "[WHAT YOU KNOW ABOUT THIS PERSON — use naturally, never recite like a list]\n"
-    result = header + "\n".join(lines)
+    result = "\n\n".join(chunks)
     if len(result) > 2000:
         result = result[:1997] + "…"
 

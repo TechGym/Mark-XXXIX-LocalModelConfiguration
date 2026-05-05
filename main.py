@@ -16,7 +16,9 @@ from google import genai
 from google.genai import types
 from ui import JarvisUI
 from memory.memory_manager import (
-    load_memory, format_memory_for_prompt,
+    assistant_persona_final_override,
+    format_memory_for_prompt,
+    load_memory,
 )
 
 from jarvis_tool_runner import run_jarvis_tool
@@ -601,7 +603,8 @@ TOOL_DECLARATIONS = [
                 "category": {
                     "type": "STRING",
                     "description": (
-                        "identity — name, age, birthday, city, job, language, nationality | "
+                        "identity — name (human user), assistant_name (what the AI calls itself), "
+                        "age, birthday, city, job, language, nationality | "
                         "preferences — favorite food/color/music/film/game/sport, hobbies | "
                         "projects — active projects, goals, things being built | "
                         "relationships — friends, family, partner, colleagues | "
@@ -684,6 +687,9 @@ class JarvisLive:
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
+        tail = assistant_persona_final_override(memory)
+        if tail:
+            parts.append(tail)
 
         voice_name = get_gemini_live_voice_name()
         return types.LiveConnectConfig(

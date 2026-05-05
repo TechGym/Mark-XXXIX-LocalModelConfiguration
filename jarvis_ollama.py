@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import threading
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -24,7 +25,11 @@ from jarvis_tool_runner import (
     run_jarvis_tool,
     synthetic_tool_calls_from_text,
 )
-from memory.memory_manager import format_memory_for_prompt, load_memory
+from memory.memory_manager import (
+    assistant_persona_final_override,
+    format_memory_for_prompt,
+    load_memory,
+)
 
 
 def _base_dir() -> Path:
@@ -308,6 +313,7 @@ class JarvisOllama:
         self._ollama_tools = ollama_tools_from_gemini_declarations(tool_declarations)
         # Set False after Ollama returns HTTP 400 with tools (e.g. vision-only chat tag).
         self._ollama_tools_enabled = True
+        self._coqui_preload_started = False
 
     def _build_system_instruction(self) -> str:
         from datetime import datetime
@@ -386,6 +392,9 @@ class JarvisOllama:
             "**text**, **DM**, or **message on WhatsApp/Telegram/etc.** — short social "
             "greetings are **not** desktop messaging tasks."
         )
+        tail = assistant_persona_final_override(memory)
+        if tail:
+            parts.append(tail)
         return "\n".join(parts)
 
     def speak(self, text: str) -> None:
@@ -650,6 +659,18 @@ class JarvisOllama:
             try:
                 self.ui.set_state("LISTENING")
                 self.ui.write_log("SYS: JARVIS online (local Ollama).")
+                if not self._coqui_preload_started:
+                    self._coqui_preload_started = True
+
+                    def _preload_coqui() -> None:
+                        try:
+                            from mark_coqui_tts import preload_coqui_engine
+
+                            preload_coqui_engine()
+                        except Exception as ex:
+                            print(f"[TTS] Coqui preload: {ex}")
+
+                    threading.Thread(target=_preload_coqui, daemon=True).start()
                 while True:
                     item: Any = await self._user_queue.get()
                     try:
