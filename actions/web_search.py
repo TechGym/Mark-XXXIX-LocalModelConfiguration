@@ -446,6 +446,7 @@ def _compare(items: list[str], aspect: str) -> str:
 def web_search(
     parameters:     dict,
     response=None,
+    player=None,
     session_memory=None,
 ) -> str:
     params = parameters or {}
