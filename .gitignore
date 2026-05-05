@@ -10,3 +10,6 @@ env/
 
 # Local secrets (created by setup UI)
 config/api_keys.json
+
+# Local persistent memory (device-specific)
+memory/long_term.json
